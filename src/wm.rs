@@ -4,14 +4,16 @@ use anyhow::{Context, Result};
 use xcb::{
     x::{
         ChangeWindowAttributes, CreateGlyphCursor, Cw, Drawable, EventMask, GetGeometry,
-        GetWindowAttributes, OpenFont, Window,
+        OpenFont, Window, Event as XEvent,
     },
+    Event as XcbEvent,
     Connection,
 };
 
 use crate::{
     atoms::Atoms,
     config,
+    events::{Event, MouseButton},
     keyboard::Keyboard,
     layout::{AbstractWindow, Layout, Tiler},
 };
@@ -132,41 +134,47 @@ impl Wm {
         loop {
             let ev = self
                 .conn
-                .poll_for_event()
+                .wait_for_event()
                 .context("Ran into an error while trying to fetch the next event")?;
-
-            if let Some(ev) = ev {
-                match ev {
-                    xcb::Event::X(x_ev) => match x_ev {
-                        xcb::x::Event::KeyPress(ev) => {
-                            let ev = self.keyboard.translate_event(ev, true);
-                            println!("Got Key Event: {ev:?}");
-                        }
-                        xcb::x::Event::KeyRelease(ev) => {
-                            let ev = self.keyboard.translate_event(ev, false);
-                            println!("Got Key Event: {ev:?}");
-                        }
-                        xcb::x::Event::EnterNotify(ev) => {
-                            println!("Entered child {:?} at {},{}", ev.child(), ev.event_x(), ev.event_y());
-                        }
-                        xcb::x::Event::ButtonPress(ev) => {
-                            println!("Pressed Mouse Button {}", ev.detail());
-                        }
-                        xcb::x::Event::ButtonRelease(ev) => {
-                            println!("Released Mouse Button {}", ev.detail());
-                        }
-                        _ => println!("Unhandled XEvent: {x_ev:?}"),
-                    },
-                    xcb::Event::Xkb(xcb::xkb::Event::StateNotify(xkb_ev))
-                        if xkb_ev.device_id() as i32 == self.keyboard.device_id() =>
-                    {
-                        self.keyboard.update_state(xkb_ev)
-                    }
-                    _ => println!("Unhandled Event: {ev:?}"),
-                }
-            }
+            let Some(ev) = self.translate_event(ev) else { continue; };
+            println!("{ev:?}");
         }
         Ok(())
+    }
+
+    fn translate_event(&self, event: xcb::Event) -> Option<Event> {
+        match event {
+            XcbEvent::X(XEvent::KeyPress(event)) => Some(self.keyboard.translate_event(event, true)),
+            XcbEvent::X(XEvent::KeyRelease(event)) => Some(self.keyboard.translate_event(event, false)),
+            XcbEvent::X(XEvent::ButtonPress(btn)) if btn.detail() == 4 => Some(Event::MouseScroll(-1)),
+            XcbEvent::X(XEvent::ButtonPress(btn)) if btn.detail() == 5 => Some(Event::MouseScroll(1)),
+            XcbEvent::X(XEvent::ButtonRelease(btn)) if btn.detail() == 4 || btn.detail() == 5 => None,
+            XcbEvent::X(XEvent::ButtonPress(btn)) => MouseButton::try_from(btn.detail()).ok().map(Event::ButtonPress),
+            XcbEvent::X(XEvent::ButtonRelease(btn)) => MouseButton::try_from(btn.detail()).ok().map(Event::ButtonRelease),
+            
+            XcbEvent::X(XEvent::MotionNotify(ev)) => Some(Event::MouseMove {
+                absolute_x: ev.root_x(),
+                absolute_y: ev.root_y(),
+                window_x: ev.event_x(),
+                window_y: ev.event_y(),
+            }),
+
+            XcbEvent::X(XEvent::MapRequest(ev)) => Some(Event::MapRequest(ev.window())),
+            XcbEvent::X(XEvent::EnterNotify(ev)) => Some(Event::EnterNotify(ev.event())),
+            XcbEvent::X(XEvent::UnmapNotify(ev)) => Some(Event::EnterNotify(ev.window())),
+            XcbEvent::X(XEvent::DestroyNotify(ev)) => Some(Event::DestroyNotify(ev.event())),
+
+            XcbEvent::Xkb(xcb::xkb::Event::StateNotify(xkb_ev))
+                if xkb_ev.device_id() as i32 == self.keyboard.device_id() =>
+            {
+                self.keyboard.update_state(xkb_ev);
+                None
+            }
+            _ => {
+                println!("Unhandled Event: {event:?}");
+                None
+            }
+        }
     }
 }
 

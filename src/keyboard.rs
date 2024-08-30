@@ -9,6 +9,8 @@ use xkbcommon::xkb::{
     x11::{get_core_keyboard_device_id, keymap_new_from_device, state_new_from_device}, Context, Keycode, Keymap, Keysym, LayoutIndex, ModMask, State, CONTEXT_NO_FLAGS, KEYMAP_COMPILE_NO_FLAGS
 };
 
+use crate::events::Event;
+
 pub const MODS_CTRL: u8 = 0x01 << 0;
 pub const MODS_SHIFT: u8 = 0x01 << 1;
 pub const MODS_META: u8 = 0x01 << 2;
@@ -17,49 +19,23 @@ pub const MODS_SUPER: u8 = 0x01 << 4;
 pub const MODS_MASK: u8 = MODS_CTRL | MODS_SHIFT | MODS_META | MODS_ALT | MODS_SUPER;
 
 #[derive(Debug, Clone)]
-pub enum KeyboardEvent {
-    Press {
+pub struct KeyboardEvent {
         key: Keysym,
         characters: Box<str>,
         mods: u8,
-    },
-    Release {
-        key: Keysym,
-        characters: Box<str>,
-        mods: u8,
-    },
 }
 
 macro_rules! is_mod {
     ($($name: ident = $mod: ident;)*) => {
         $(
             pub fn $name(&self) -> bool {
-                (self.get_mods() & $mod) > 0
+                (self.mods & $mod) > 0
             }
         )*
     };
 }
 
 impl KeyboardEvent {
-    pub fn get_str(&self) -> &str {
-        match self {
-            Self::Press { characters, .. } | Self::Release { characters, .. } => &**characters,
-        }
-    }
-    pub fn get_mods(&self) -> u8 {
-        match self {
-            Self::Press { mods, .. } | Self::Release { mods, .. } => *mods,
-        }
-    }
-    pub fn get_key(&self) -> Keysym {
-        match self {
-            Self::Press { key, .. } | Self::Release { key, .. } => *key,
-        }
-    }
-    pub fn is_down(&self) -> bool {
-        matches!(self, KeyboardEvent::Press { .. })
-    }
-
     is_mod! {
         is_ctrl = MODS_CTRL;
         is_shift = MODS_SHIFT;
@@ -144,7 +120,7 @@ impl Keyboard {
         );
     }
 
-    pub fn translate_event(&self, event: KeyPressEvent, press: bool) -> KeyboardEvent {
+    pub fn translate_event(&self, event: KeyPressEvent, press: bool) -> Event {
         let code = Keycode::from(event.detail());
         let keysym = self.state.borrow().key_get_one_sym(code);
 
@@ -168,17 +144,17 @@ impl Keyboard {
         }
 
         if press {
-            KeyboardEvent::Press {
+            Event::KeyPress(KeyboardEvent {
                 key: keysym,
                 characters: self.state.borrow().key_get_utf8(code).into_boxed_str(),
                 mods: self.mods.get(),
-            }
+            })
         } else {
-            KeyboardEvent::Release {
+            Event::KeyRelease(KeyboardEvent {
                 key: keysym,
                 characters: Box::<str>::default(),
                 mods: self.mods.get(),
-            }
+            })
         }
     }
 }

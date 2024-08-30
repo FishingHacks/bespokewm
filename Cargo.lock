@@ -42,6 +42,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c4b4d0bd25bd0b74681c0ad21497610ce1b7c91b1022cd21c80c6fbdd9476b0"
 
 [[package]]
+name = "bespoke"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "raylib",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "xcb",
+ "xkbcommon",
+]
+
+[[package]]
 name = "bindgen"
 version = "0.69.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -900,19 +913,6 @@ name = "windows_x86_64_msvc"
 version = "0.52.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
-
-[[package]]
-name = "wm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "raylib",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "xcb",
- "xkbcommon",
-]
 
 [[package]]
 name = "x11"

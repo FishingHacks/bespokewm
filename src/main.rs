@@ -10,6 +10,7 @@ macro_rules! request_sync {
     };
 }
 
+pub mod events;
 pub mod keyboard;
 pub mod layout;
 pub mod atoms;
