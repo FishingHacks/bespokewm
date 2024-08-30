@@ -6,7 +6,7 @@ use crate::keyboard::KeyboardEvent;
 pub enum MouseButton {
     Left = 1,
     Middle = 2,
-    Right = 3
+    Right = 3,
 }
 impl TryFrom<u8> for MouseButton {
     type Error = ();
@@ -16,7 +16,7 @@ impl TryFrom<u8> for MouseButton {
             1 => Ok(Self::Left),
             2 => Ok(Self::Middle),
             3 => Ok(Self::Right),
-            _ => Err(())
+            _ => Err(()),
         }
     }
 }

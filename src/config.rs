@@ -29,7 +29,7 @@ fn get_data_dir() -> anyhow::Result<PathBuf> {
 
         return Ok(path);
     }
-    
+
     anyhow::bail!("failed to get the $HOME variable");
 }
 
@@ -37,11 +37,8 @@ pub fn get_log_file() -> anyhow::Result<(PathBuf, String)> {
     Ok((get_data_dir()?, format!("{}.log", APP_NAME)))
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Action {
-    Quit,
-}
-
-
-
 pub const GAP_SIZE: u16 = 2;
+
+pub const BORDER_SIZE: u16 = 2;
+pub const BORDER_COLOR: u32 = 0xff252525;
+pub const BORDER_COLOR_ACTIVE: u32 = 0xff2D4F67;

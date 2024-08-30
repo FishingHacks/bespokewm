@@ -1,28 +1,29 @@
-use std::sync::Arc;
+use std::{process::Command, sync::Arc};
 
 use anyhow::{Context, Result};
+use tracing::error;
 use xcb::{
     x::{
-        ChangeWindowAttributes, CreateGlyphCursor, Cw, Drawable, EventMask, GetGeometry,
-        OpenFont, Window, Event as XEvent,
+        ChangeWindowAttributes, CreateGlyphCursor, Cw, Drawable, Event as XEvent, EventMask,
+        GetGeometry, OpenFont, Window,
     },
-    Event as XcbEvent,
-    Connection,
+    Connection, Event as XcbEvent,
 };
 
 use crate::{
+    actions::{Action, ActionType},
     atoms::Atoms,
-    config,
     events::{Event, MouseButton},
     keyboard::Keyboard,
-    layout::{AbstractWindow, Layout, Tiler},
+    screen::Screen,
 };
 
 pub struct Wm {
     conn: Arc<Connection>,
-    workspaces: [Tiler<Window>; 10],
+    screen: Screen,
     atoms: Atoms,
     keyboard: Keyboard,
+    root: Window,
 }
 
 impl Wm {
@@ -51,18 +52,22 @@ impl Wm {
 
         let keyboard = Keyboard::new(&conn).context("Failed to initialise the keyboard")?;
 
-        let mut workspaces = Self::make_workspaces(
+        let screen = Screen::new(
             root_dimensions.width(),
             root_dimensions.height(),
-            config::GAP_SIZE,
-        );
-        workspaces[0].show(&conn);
+            0,
+            atoms,
+            root,
+            conn.clone(),
+        )
+        .context("Failed to initialise the screen")?;
 
         Ok(Self {
             conn,
-            workspaces,
+            screen,
             atoms,
             keyboard,
+            root,
         })
     }
 
@@ -115,43 +120,100 @@ impl Wm {
         Ok(window)
     }
 
-    fn make_workspaces(width: u16, height: u16, gaps: u16) -> [Tiler<Window>; 10] {
-        [
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-            Tiler::new(width, height, gaps),
-        ]
-    }
+    pub fn run(&mut self, actions: &[Action]) -> anyhow::Result<()> {
+        let bound_actions = self.keyboard.bind_actions(actions, &self.conn, self.root);
+        println!("{bound_actions:?}");
+        let mut procs = vec![];
 
-    pub fn run(&mut self) -> anyhow::Result<()> {
-        loop {
+        'mainloop: loop {
             let ev = self
                 .conn
                 .wait_for_event()
                 .context("Ran into an error while trying to fetch the next event")?;
-            let Some(ev) = self.translate_event(ev) else { continue; };
-            println!("{ev:?}");
+            let Some(ev) = self.translate_event(ev) else {
+                continue;
+            };
+
+            match ev {
+                Event::KeyPress(ev) => {
+                    for action in bound_actions.iter() {
+                        println!("{action:?} {:?} {:?}", ev.keycode, ev.mods);
+                        if action.key == ev.keycode && action.modifiers == ev.mods {
+                            match actions[action.action_index].action {
+                                ActionType::Quit => break 'mainloop,
+                                ActionType::CycleLayout => self.screen.cycle_layout(),
+                                ActionType::SwitchToLayout(new_layout) => {
+                                    self.screen.set_layout(new_layout)
+                                }
+                                ActionType::Launch(cmd) => {
+                                    let mut command = Command::new(cmd);
+                                    if let Some(display) = std::env::var_os("DISPLAY")
+                                        .and_then(|str| str.into_string().ok())
+                                    {
+                                        command.env("DISPLAY", display);
+                                    }
+                                    match command.spawn() {
+                                        Err(e) => {
+                                            error!("Failed to run Action: Failed to run Command: {e:?}")
+                                        }
+                                        Ok(child) => procs.push(child),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Event::MapRequest(window) => trace_result!(self.screen.add_window(window)),
+                Event::DestroyNotify(window) => self.screen.remove_window(window),
+                Event::EnterNotify(window) => self.screen.enter_client(window),
+                _ => {}
+            }
+
+            // clean up child processes
+            let len = procs.len();
+            for i in 0..len {
+                let i = len - 1 - i;
+                // the process exited
+                if !matches!(procs[i].try_wait(), Ok(None)) {
+                    procs.remove(i);
+                }
+            }
         }
+
+        self.keyboard
+            .unbind_actions(&bound_actions, &self.conn, self.root);
+        self.screen.kill_children();
+        for proc in procs.iter_mut() {
+            _ = proc.kill();
+        }
+        procs.clear();
         Ok(())
     }
 
     fn translate_event(&self, event: xcb::Event) -> Option<Event> {
         match event {
-            XcbEvent::X(XEvent::KeyPress(event)) => Some(self.keyboard.translate_event(event, true)),
-            XcbEvent::X(XEvent::KeyRelease(event)) => Some(self.keyboard.translate_event(event, false)),
-            XcbEvent::X(XEvent::ButtonPress(btn)) if btn.detail() == 4 => Some(Event::MouseScroll(-1)),
-            XcbEvent::X(XEvent::ButtonPress(btn)) if btn.detail() == 5 => Some(Event::MouseScroll(1)),
-            XcbEvent::X(XEvent::ButtonRelease(btn)) if btn.detail() == 4 || btn.detail() == 5 => None,
-            XcbEvent::X(XEvent::ButtonPress(btn)) => MouseButton::try_from(btn.detail()).ok().map(Event::ButtonPress),
-            XcbEvent::X(XEvent::ButtonRelease(btn)) => MouseButton::try_from(btn.detail()).ok().map(Event::ButtonRelease),
-            
+            XcbEvent::X(XEvent::KeyPress(event)) => {
+                Some(self.keyboard.translate_event(event, true))
+            }
+            XcbEvent::X(XEvent::KeyRelease(event)) => {
+                Some(self.keyboard.translate_event(event, false))
+            }
+            XcbEvent::X(XEvent::ButtonPress(btn)) if btn.detail() == 4 => {
+                Some(Event::MouseScroll(-1))
+            }
+            XcbEvent::X(XEvent::ButtonPress(btn)) if btn.detail() == 5 => {
+                Some(Event::MouseScroll(1))
+            }
+            XcbEvent::X(XEvent::ButtonRelease(btn)) if btn.detail() == 4 || btn.detail() == 5 => {
+                None
+            }
+            XcbEvent::X(XEvent::ButtonPress(btn)) => MouseButton::try_from(btn.detail())
+                .ok()
+                .map(Event::ButtonPress),
+            XcbEvent::X(XEvent::ButtonRelease(btn)) => MouseButton::try_from(btn.detail())
+                .ok()
+                .map(Event::ButtonRelease),
+
             XcbEvent::X(XEvent::MotionNotify(ev)) => Some(Event::MouseMove {
                 absolute_x: ev.root_x(),
                 absolute_y: ev.root_y(),
@@ -159,10 +221,10 @@ impl Wm {
                 window_y: ev.event_y(),
             }),
 
-            XcbEvent::X(XEvent::MapRequest(ev)) => Some(Event::MapRequest(ev.window())),
             XcbEvent::X(XEvent::EnterNotify(ev)) => Some(Event::EnterNotify(ev.event())),
-            XcbEvent::X(XEvent::UnmapNotify(ev)) => Some(Event::EnterNotify(ev.window())),
-            XcbEvent::X(XEvent::DestroyNotify(ev)) => Some(Event::DestroyNotify(ev.event())),
+            XcbEvent::X(XEvent::MapRequest(ev)) => Some(Event::MapRequest(ev.window())),
+            XcbEvent::X(XEvent::DestroyNotify(ev)) => Some(Event::DestroyNotify(ev.window())),
+            XcbEvent::X(XEvent::ReparentNotify(_)) => None,
 
             XcbEvent::Xkb(xcb::xkb::Event::StateNotify(xkb_ev))
                 if xkb_ev.device_id() as i32 == self.keyboard.device_id() =>
@@ -170,24 +232,7 @@ impl Wm {
                 self.keyboard.update_state(xkb_ev);
                 None
             }
-            _ => {
-                println!("Unhandled Event: {event:?}");
-                None
-            }
+            _ => None,
         }
-    }
-}
-
-impl AbstractWindow for Window {
-    fn update(&mut self, width: u16, height: u16, x: u16, y: u16, conn: &Connection) {
-        todo!()
-    }
-
-    fn hide(&mut self, conn: &Connection) {
-        todo!()
-    }
-
-    fn show(&mut self, conn: &Connection) {
-        todo!()
     }
 }

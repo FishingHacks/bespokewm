@@ -15,7 +15,7 @@ macro_rules! atoms {
                 .expect("failed to get internal cookie")
                 .atom()
         }
-        
+
         fn get_internal_atom(conn: &Connection, name: &[u8]) -> InternAtomCookie {
             conn.send_request(&InternAtom {
                 name,
@@ -23,8 +23,9 @@ macro_rules! atoms {
             })
         }
 
+        #[derive(Debug, Clone, Copy)]
         $visibility struct $struct_name {
-            $($name: Atom),*
+            $(pub $name: Atom),*
         }
 
         impl Atoms {

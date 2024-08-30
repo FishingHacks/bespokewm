@@ -1,21 +1,45 @@
+use tracing::info;
 use wm::Wm;
 
-// #[macro_export]
+macro_rules! trace_result {
+    ($value: expr) => {
+        match $value {
+            Ok(_) => {},
+            Err(e) => {
+                error!("{e:?}");
+            }
+        }
+    };
+    ($value: expr; $context: expr) => {
+        match $value.context($context) {
+            Ok(_) => {},
+            Err(e) => {
+                error!("{e:?}");
+            }
+        }
+    };
+}
+
 macro_rules! request_sync {
     ($conn: expr => $request: expr) => {
         $conn.wait_for_reply($conn.send_request(&$request))?
     };
     ($conn: expr => $request: expr; $context: expr) => {
-        $conn.wait_for_reply($conn.send_request(&$request)).context($context)?
+        $conn
+            .wait_for_reply($conn.send_request(&$request))
+            .context($context)?
     };
 }
 
+pub mod actions;
+pub mod ewmh;
+pub mod atoms;
+mod config;
 pub mod events;
 pub mod keyboard;
 pub mod layout;
-pub mod atoms;
+pub mod screen;
 mod wm;
-mod config;
 
 fn main() -> anyhow::Result<()> {
     let (dir, log_file) = config::get_log_file()?;
@@ -28,7 +52,9 @@ fn main() -> anyhow::Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber).expect("Setting the subscriber failed");
 
+    info!("acd");
+
     let mut wm = Wm::new()?;
 
-    wm.run()
+    wm.run(actions::ACTIONS)
 }
