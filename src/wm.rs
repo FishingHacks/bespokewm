@@ -136,12 +136,13 @@ impl Wm {
 
             match ev {
                 Event::KeyPress(ev) => {
+                    println!("{ev:?}");
                     for action in bound_actions.iter() {
-                        println!("{action:?} {:?} {:?}", ev.keycode, ev.mods);
                         if action.key == ev.keycode && action.modifiers == ev.mods {
                             match actions[action.action_index].action {
                                 ActionType::Quit => break 'mainloop,
                                 ActionType::CycleLayout => self.screen.cycle_layout(),
+                                ActionType::CloseFocusedWindow => self.screen.close_focused_window(),
                                 ActionType::SwitchToLayout(new_layout) => {
                                     self.screen.set_layout(new_layout)
                                 }

@@ -1,6 +1,6 @@
-use std::{cell::{Cell, RefCell}, collections::HashMap};
+use std::{cell::RefCell, collections::HashMap};
 
-use tracing::{error, info};
+use tracing::error;
 use xcb::{
     x::{GrabKey, KeyPressEvent, ModMask as XModMask, UngrabKey, Window},
     xkb::{EventType, MapPart, SelectEvents, StateNotifyEvent, UseExtension},
@@ -22,15 +22,15 @@ pub const MODS_MASK: u8 = MODS_CTRL | MODS_SHIFT | MODS_ALT | MODS_SUPER;
 pub struct KeyboardEvent {
     pub key: Keysym,
     pub characters: Box<str>,
-    pub mods: u8,
+    pub mods: XModMask,
     pub keycode: Keycode,
 }
 
 macro_rules! is_mod {
-    ($($name: ident = $mod: ident;)*) => {
+    ($($name: ident = $mod: expr;)*) => {
         $(
             pub fn $name(&self) -> bool {
-                (self.mods & $mod) > 0
+                self.mods.contains($mod)
             }
         )*
     };
@@ -38,10 +38,13 @@ macro_rules! is_mod {
 
 impl KeyboardEvent {
     is_mod! {
-        is_ctrl = MODS_CTRL;
-        is_shift = MODS_SHIFT;
-        is_alt = MODS_ALT;
-        is_super = MODS_SUPER;
+        is_shift = XModMask::SHIFT;
+        is_caps_lock = XModMask::LOCK;
+        is_ctrl = XModMask::CONTROL;
+        is_alt = XModMask::N1;
+        is_num_lock = XModMask::N2;
+        is_scroll_locl = XModMask::N3;
+        is_super = XModMask::N4;
     }
 }
 
@@ -50,21 +53,24 @@ pub struct Keyboard {
     _keymap: Keymap,
     device_id: i32,
     state: RefCell<State>,
-    mods: Cell<u8>,
 }
 
 #[derive(Debug)]
 pub struct BoundAction {
     pub key: Keycode,
-    xmodifiers: XModMask,
-    pub modifiers: u8,
+    pub modifiers: XModMask,
     pub action_index: usize,
 }
 
 impl Keyboard {
-    pub fn bind_actions(&self, actions: &[Action], conn: &Connection, root_window: Window) -> Vec<BoundAction> {
+    pub fn bind_actions(
+        &self,
+        actions: &[Action],
+        conn: &Connection,
+        root_window: Window,
+    ) -> Vec<BoundAction> {
         let mut keycode_map = HashMap::<Keysym, Keycode>::new();
-        
+
         let state = self.state.borrow();
         state.get_keymap().key_for_each(|_, keycode| {
             keycode_map.insert(state.key_get_one_sym(keycode), keycode);
@@ -97,7 +103,11 @@ impl Keyboard {
                     pointer_mode: xcb::x::GrabMode::Async,
                     owner_events: false,
                 }));
-                bound_actions.push(BoundAction { key: *key, xmodifiers: modifiers, action_index: i, modifiers: actions[i].mods });
+                bound_actions.push(BoundAction {
+                    key: *key,
+                    modifiers,
+                    action_index: i,
+                });
             }
         }
 
@@ -111,13 +121,23 @@ impl Keyboard {
 
         bound_actions
     }
-    
-    pub fn unbind_actions(&self, bound_actions: &[BoundAction], conn: &Connection, root_window: Window) {
-        let cookies = bound_actions.iter().map(|bound_action| conn.send_request_checked(&UngrabKey {
-            grab_window: root_window,
-            key: bound_action.key.into(),
-            modifiers: bound_action.xmodifiers,
-        })).collect::<Vec<_>>();
+
+    pub fn unbind_actions(
+        &self,
+        bound_actions: &[BoundAction],
+        conn: &Connection,
+        root_window: Window,
+    ) {
+        let cookies = bound_actions
+            .iter()
+            .map(|bound_action| {
+                conn.send_request_checked(&UngrabKey {
+                    grab_window: root_window,
+                    key: bound_action.key.into(),
+                    modifiers: bound_action.modifiers,
+                })
+            })
+            .collect::<Vec<_>>();
 
         for cookie in cookies.into_iter() {
             if let Err(e) = conn.check_request(cookie) {
@@ -175,7 +195,6 @@ impl Keyboard {
             _keymap: keymap,
             device_id,
             state: RefCell::new(state),
-            mods: Cell::new(0),
         })
     }
 
@@ -196,38 +215,22 @@ impl Keyboard {
 
     pub fn translate_event(&self, event: KeyPressEvent, press: bool) -> Event {
         let keycode = Keycode::from(event.detail());
-        let keysym = self.state.borrow().key_get_one_sym(keycode);
-
-        let modmask = match keysym {
-            Keysym::Control_L | Keysym::Control_R => MODS_CTRL,
-            Keysym::Alt_L | Keysym::Alt_R => MODS_ALT,
-            Keysym::Shift_L | Keysym::Shift_R => MODS_SHIFT,
-            Keysym::Super_L | Keysym::Super_R => MODS_SUPER,
-
-            _ => 0u8,
-        };
-
-        if modmask != 0 {
-            let mods = self.mods.get();
-            self.mods.set(if press {
-                mods | modmask
-            } else {
-                mods & !modmask
-            });
-        }
+        let state = self.state.borrow();
+        let keysym = state.key_get_one_sym(keycode);
+        let mods = XModMask::from_bits_truncate(event.state().bits());
 
         if press {
             Event::KeyPress(KeyboardEvent {
                 key: keysym,
-                characters: self.state.borrow().key_get_utf8(keycode).into_boxed_str(),
-                mods: self.mods.get(),
+                characters: state.key_get_utf8(keycode).into_boxed_str(),
+                mods,
                 keycode,
             })
         } else {
             Event::KeyRelease(KeyboardEvent {
                 key: keysym,
                 characters: Box::<str>::default(),
-                mods: self.mods.get(),
+                mods,
                 keycode,
             })
         }

@@ -1,14 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result};
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 use xcb::{
     x::{
         ChangeWindowAttributes, ConfigWindow, ConfigureWindow, CreateWindow, Cw, DestroyWindow,
         EventMask, MapWindow, ReparentWindow, SetInputFocus, UnmapWindow, Window as XWindow,
         COPY_FROM_PARENT, CURRENT_TIME,
     },
-    Connection,
+    Connection, Xid,
 };
 
 use crate::{
@@ -32,6 +32,10 @@ pub struct Screen {
     atoms: Atoms,
     root_window: XWindow,
     connection: Arc<Connection>,
+
+    /// Option<(window, frame)>
+    /// The frame may be Window(0) to indicate the window is a reserved client
+    focused_window: Option<(XWindow, XWindow)>,
 }
 
 impl Screen {
@@ -67,6 +71,7 @@ impl Screen {
                 Workspace::new(width, height, gap, 10),
             ],
             global_windows: vec![],
+            focused_window: None,
             current_workspace: 1,
         };
         ewmh::set_number_of_desktops(10, root_window, &atoms, &me.connection)?;
@@ -116,6 +121,12 @@ impl Screen {
             error!("Tried to register >255 global clients!");
             anyhow::bail!("Not supporting >255 global clients!");
         }
+        _ = self
+            .connection
+            .send_and_check_request(&ChangeWindowAttributes {
+                window: client.window,
+                value_list: &[Cw::EventMask(EventMask::ENTER_WINDOW)],
+            });
         self.global_windows.push(client);
         self.update_atoms()?;
         Ok(())
@@ -165,6 +176,7 @@ impl Screen {
                 focus: self.root_window,
                 revert_to: xcb::x::InputFocus::Parent
             }); "failed to give root focus");
+            self.focused_window = None;
 
             return;
         }
@@ -173,7 +185,20 @@ impl Screen {
             let workspace = &mut self.workspaces[*workspace as usize];
             let client = workspace.find_client(|v| v.frame == client);
             if let Some(client) = client {
+                self.focused_window = Some((client.window, client.frame));
                 workspace.focus_client(*client, &self.connection);
+            }
+        } else {
+            for reserved_client in self.global_windows.iter() {
+                if reserved_client.window == client {
+                    self.connection.send_request(&SetInputFocus {
+                        time: CURRENT_TIME,
+                        focus: reserved_client.window,
+                        revert_to: xcb::x::InputFocus::Parent,
+                    });
+                    self.focused_window = Some((reserved_client.window, XWindow::none()));
+                    break;
+                }
             }
         }
     }
@@ -217,6 +242,41 @@ impl Screen {
         Ok(())
     }
 
+    pub fn close_focused_window(&mut self) {
+        let Some((window, frame)) = self.focused_window else {
+            return;
+        };
+        self.focused_window = None;
+
+        if frame.is_none() {
+            // global window
+
+            let len = self.global_windows.len();
+            for i in 0..len {
+                let i = len - 1 - i;
+                if self.global_windows[i].window == window {
+                    if ewmh::delete_window(
+                        self.global_windows[i].window,
+                        &self.atoms,
+                        &self.connection,
+                    ) {
+                        self.global_windows.remove(i);
+                    }
+                }
+            }
+        } else {
+            if let Some(&workspace_id) = self.window_lookup.get(&frame) {
+                for client in self.workspaces[workspace_id as usize].close_window(
+                    |c| c.window == window,
+                    &self.atoms,
+                    &self.connection,
+                ) {
+                    self.window_lookup.remove(&client.frame);
+                }
+            }
+        }
+    }
+
     pub fn cycle_layout(&mut self) {
         self.workspaces[self.current_workspace as usize].cycle_layout(&self.connection);
         _ = self.update_atoms();
@@ -235,11 +295,17 @@ impl Screen {
         })];
 
         for client in self.workspaces.iter().flat_map(Workspace::windows) {
-            cookies.push(self.connection.send_request_checked(&DestroyWindow { window: client.window }));
-            cookies.push(self.connection.send_request_checked(&DestroyWindow { window: client.frame }));
+            cookies.push(self.connection.send_request_checked(&DestroyWindow {
+                window: client.window,
+            }));
+            cookies.push(self.connection.send_request_checked(&DestroyWindow {
+                window: client.frame,
+            }));
         }
         for window in self.global_windows.iter() {
-            cookies.push(self.connection.send_request_checked(&DestroyWindow { window: window.window }));
+            cookies.push(self.connection.send_request_checked(&DestroyWindow {
+                window: window.window,
+            }));
         }
 
         self.global_windows.clear();
@@ -247,7 +313,9 @@ impl Screen {
         self.reserved_space_left = 0;
         self.reserved_space_right = 0;
         self.reserved_space_top = 0;
-        self.workspaces.iter_mut().for_each(Workspace::clear_windows);
+        self.workspaces
+            .iter_mut()
+            .for_each(Workspace::clear_windows);
 
         for cookie in cookies.into_iter() {
             _ = self.connection.check_request(cookie);
@@ -359,6 +427,15 @@ impl AbstractWindow for Client {
     fn destroy(&mut self, conn: &Connection) {
         trace_result!(conn.send_and_check_request(&UnmapWindow { window: self.frame }); "failed to unmap the frame");
         trace_result!(conn.send_and_check_request(&DestroyWindow { window: self.frame }); "failed to destroy the frame");
+    }
+
+    fn close(&mut self, atoms: &Atoms, conn: &Connection) -> bool {
+        if ewmh::delete_window(self.window, atoms, conn) {
+            self.destroy(conn);
+            true
+        } else {
+            false
+        }
     }
 
     fn focus(&mut self, conn: &Connection) {

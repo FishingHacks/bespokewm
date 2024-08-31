@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use xcb::{x::DestroyWindow, Connection};
+use xcb::Connection;
 
 pub trait AbstractWindow: Debug + Eq + Copy {
     fn update(&mut self, width: u16, height: u16, x: u16, y: u16, conn: &Connection);
@@ -9,6 +9,11 @@ pub trait AbstractWindow: Debug + Eq + Copy {
     fn focus(&mut self, conn: &Connection);
     fn unfocus(&mut self, conn: &Connection);
     fn destroy(&mut self, conn: &Connection);
+    /// Requests a window delete
+    /// If this function returns true, it means we have
+    /// removed the window and not just scheduled a delete
+    /// Thus we need to remove the window from all relevant places
+    fn close(&mut self, atoms: &crate::atoms::Atoms, conn: &Connection) -> bool;
 }
 #[derive(Debug)]
 pub struct ClientWindow<T: AbstractWindow> {
@@ -275,7 +280,7 @@ pub struct Workspace<T: AbstractWindow> {
     is_showing: bool,
     name: String,
     id: u32,
-    focused: Vec<T>,
+    focused: Option<T>,
 }
 
 impl<T: AbstractWindow> Workspace<T> {
@@ -283,7 +288,7 @@ impl<T: AbstractWindow> Workspace<T> {
         Self {
             windows: vec![],
             floating_windows: vec![],
-            focused: vec![],
+            focused: None,
             pos: Position::new(0, 0, width, height),
             gap,
             layout: Layout::Grid,
@@ -386,15 +391,7 @@ impl<T: AbstractWindow> Workspace<T> {
 
     pub fn remove_window(&mut self, predicate: impl Fn(&T) -> bool, conn: &Connection) -> Vec<T> {
         let mut removed: Vec<T> = vec![];
-
-        let len = self.focused.len();
-        for i in 0..self.focused.len() {
-            let i = len - 1 - i;
-            if predicate(&self.focused[i]) {
-                self.focused[i].unfocus(conn);
-                self.focused.remove(i);
-            }
-        }
+        self.unfocus(&predicate, conn);
 
         let len = self.windows.len();
         for i in 0..self.windows.len() {
@@ -419,6 +416,35 @@ impl<T: AbstractWindow> Workspace<T> {
         }
 
         removed
+    }
+
+    /// Requests a window delete
+    /// Returns all removed clients
+    pub fn close_window(&mut self, predicate: impl Fn(&T) -> bool, atoms: &crate::atoms::Atoms, conn: &Connection) -> Vec<T> {
+        let mut clients = vec![];
+        self.unfocus(&predicate, conn);
+
+        let len = self.windows.len();
+        for i in 0..len {
+            let i = len - 1 - i;
+            if predicate(&self.windows[i].data) {
+                if self.windows[i].data.close(atoms, conn) {
+                    clients.push(self.windows.remove(i).data);
+                }
+            }
+        }
+
+        let len = self.floating_windows.len();
+        for i in 0..len {
+            let i = len - 1 - i;
+            if predicate(&self.floating_windows[i].data) {
+                if self.floating_windows[i].data.close(atoms, conn) {
+                    clients.push(self.floating_windows.remove(i).data);
+                }
+            }
+        }
+
+        clients
     }
 
     pub fn set_screen_size(&mut self, width: u16, height: u16, conn: &Connection) {
@@ -475,31 +501,31 @@ impl<T: AbstractWindow> Workspace<T> {
     }
 
     pub fn focus_client(&mut self, mut client: T, conn: &Connection) {
+        if let Some(mut focused) = self.focused.replace(client) {
+            focused.unfocus(conn);
+        }
         client.focus(conn);
-        self.focused.push(client);
     }
 
-    pub fn unfocus_client(&mut self, mut client: T, conn: &Connection) {
-        client.unfocus(conn);
-        let len = self.focused.len();
-        for i in 0..self.focused.len() {
-            let i = len - 1 - i;
-            if self.focused[i] == client {
-                self.focused.remove(i);
+    pub fn unfocus(&mut self, predicate: &dyn Fn(&T) -> bool, conn: &Connection) {
+        if let Some(focused) = self.focused.as_ref() {
+            if predicate(focused) {
+                if let Some(mut focused) = self.focused.take() {
+                    focused.unfocus(conn);
+                }
             }
         }
     }
-
+    
     pub fn unfocus_all(&mut self, conn: &Connection) {
-        for client in self.focused.iter_mut() {
-            client.unfocus(conn);
+        if let Some(mut focused) = self.focused.take() {
+            focused.unfocus(conn);
         }
-        self.focused.clear();
     }
 
     pub fn clear_windows(&mut self) {
         self.windows.clear();
         self.floating_windows.clear();
-        self.focused.clear();
+        self.focused = None;
     }
 }

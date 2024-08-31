@@ -1,8 +1,11 @@
 use std::iter;
 
 use xcb::{
-    x::{PropMode, Window, ATOM_CARDINAL, ATOM_STRING, ATOM_WINDOW},
-    Connection,
+    x::{
+        Atom, ClientMessageData, ClientMessageEvent, DestroyWindow, EventMask, GetProperty,
+        PropMode, SendEvent, Window, ATOM_ATOM, ATOM_CARDINAL, ATOM_STRING, ATOM_WINDOW,
+    },
+    Connection, Xid,
 };
 
 use crate::{atoms::Atoms, layout::Workspace, screen::Client};
@@ -157,7 +160,12 @@ pub fn set_client_list_stacking<'a>(
 /// set desktop is a mode where the window manager is solely displaying
 /// the background while hiding every other window
 /// this never applies to us
-pub fn set_showing_desktop(is_showing: bool, root: Window, atoms: &Atoms, conn: &Connection) -> EwmhResult {
+pub fn set_showing_desktop(
+    is_showing: bool,
+    root: Window,
+    atoms: &Atoms,
+    conn: &Connection,
+) -> EwmhResult {
     change_property!(
         conn,
         root,
@@ -166,4 +174,58 @@ pub fn set_showing_desktop(is_showing: bool, root: Window, atoms: &Atoms, conn: 
         atoms.net_showing_desktop,
         &[if is_showing { 1u32 } else { 0u32 }],
     )
+}
+
+pub fn window_supports(
+    requested_atom: Atom,
+    window: Window,
+    atoms: &Atoms,
+    conn: &Connection,
+) -> bool {
+    let Ok(cookie) = conn.wait_for_reply(conn.send_request(&GetProperty {
+        delete: false,
+        long_offset: 0,
+        long_length: 4096,
+        property: atoms.wm_protocols,
+        r#type: ATOM_ATOM,
+        window,
+    })) else {
+        return false;
+    };
+
+    cookie
+        .value::<Atom>()
+        .iter()
+        .any(|&atom| atom == requested_atom)
+}
+
+pub fn delete_window(window: Window, atoms: &Atoms, conn: &Connection) -> bool {
+    if window_supports(atoms.wm_delete_window, window, atoms, conn) {
+        let event = ClientMessageEvent::new(
+            window,
+            atoms.wm_protocols,
+            ClientMessageData::Data32([
+                atoms.wm_delete_window.resource_id(),
+                xcb::x::CURRENT_TIME,
+                0,
+                0,
+                0,
+            ]),
+        );
+        if let Err(_) = conn.send_and_check_request(&SendEvent {
+            destination: xcb::x::SendEventDest::Window(window),
+            event: &event,
+            propagate: false,
+            event_mask: EventMask::NO_EVENT,
+        }) {
+            // destroy window if we cant inform that it has to destroy itself
+            _ = conn.send_and_check_request(&DestroyWindow { window });
+            true
+        } else {
+            false
+        }
+    } else {
+        _ = conn.send_and_check_request(&DestroyWindow { window });
+        true
+    }
 }
