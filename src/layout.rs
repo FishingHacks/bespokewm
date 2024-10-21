@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Display};
 
-use xcb::Connection;
+use xcb::{x::Rectangle, Connection};
 
 pub trait AbstractWindow: Debug + Eq + Copy {
     fn update(&mut self, width: u16, height: u16, x: u16, y: u16, conn: &Connection);
@@ -253,10 +253,10 @@ impl Layout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 impl Position {
@@ -266,6 +266,16 @@ impl Position {
             y,
             width,
             height,
+        }
+    }
+}
+impl Into<Rectangle> for Position {
+    fn into(self) -> Rectangle {
+        Rectangle {
+            x: self.x as i16,
+            y: self.y as i16,
+            width: self.width,
+            height: self.height,
         }
     }
 }
@@ -284,12 +294,12 @@ pub struct Workspace<T: AbstractWindow> {
 }
 
 impl<T: AbstractWindow> Workspace<T> {
-    pub fn new(width: u16, height: u16, gap: u16, id: u32) -> Self {
+    pub fn new(pos: Position, gap: u16, id: u32) -> Self {
         Self {
             windows: vec![],
             floating_windows: vec![],
             focused: None,
-            pos: Position::new(0, 0, width, height),
+            pos,
             gap,
             layout: Layout::Grid,
             is_showing: false,
@@ -420,7 +430,12 @@ impl<T: AbstractWindow> Workspace<T> {
 
     /// Requests a window delete
     /// Returns all removed clients
-    pub fn close_window(&mut self, predicate: impl Fn(&T) -> bool, atoms: &crate::atoms::Atoms, conn: &Connection) -> Vec<T> {
+    pub fn close_window(
+        &mut self,
+        predicate: impl Fn(&T) -> bool,
+        atoms: &crate::atoms::Atoms,
+        conn: &Connection,
+    ) -> Vec<T> {
         let mut clients = vec![];
         self.unfocus(&predicate, conn);
 
@@ -516,7 +531,7 @@ impl<T: AbstractWindow> Workspace<T> {
             }
         }
     }
-    
+
     pub fn unfocus_all(&mut self, conn: &Connection) {
         if let Some(mut focused) = self.focused.take() {
             focused.unfocus(conn);

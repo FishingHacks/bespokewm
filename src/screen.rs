@@ -6,7 +6,7 @@ use xcb::{
     x::{
         ChangeWindowAttributes, ConfigWindow, ConfigureWindow, CreateWindow, Cw, DestroyWindow,
         EventMask, MapWindow, ReparentWindow, SetInputFocus, UnmapWindow, Window as XWindow,
-        COPY_FROM_PARENT, CURRENT_TIME,
+        ATOM_CARDINAL, COPY_FROM_PARENT, CURRENT_TIME,
     },
     Connection, Xid,
 };
@@ -33,6 +33,7 @@ pub struct Screen {
     root_window: XWindow,
     connection: Arc<Connection>,
 
+    // draw: DrawContext,
     /// Option<(window, frame)>
     /// The frame may be Window(0) to indicate the window is a reserved client
     focused_window: Option<(XWindow, XWindow)>,
@@ -46,7 +47,11 @@ impl Screen {
         atoms: Atoms,
         root_window: XWindow,
         connection: Arc<Connection>,
+        depth: u8,
     ) -> anyhow::Result<Self, xcb::ProtocolError> {
+        // let mut draw = DrawContext::new(root_window, Position::new(0, 0, width, 25), connection.clone(), depth)?;
+        // draw.open_font("fixed")?;
+
         let mut me = Self {
             atoms,
             root_window,
@@ -58,17 +63,18 @@ impl Screen {
             reserved_space_right: 0,
             reserved_space_top: 0,
             window_lookup: Default::default(),
+            // draw,
             workspaces: [
-                Workspace::new(width, height, gap, 1),
-                Workspace::new(width, height, gap, 2),
-                Workspace::new(width, height, gap, 3),
-                Workspace::new(width, height, gap, 4),
-                Workspace::new(width, height, gap, 5),
-                Workspace::new(width, height, gap, 6),
-                Workspace::new(width, height, gap, 7),
-                Workspace::new(width, height, gap, 8),
-                Workspace::new(width, height, gap, 9),
-                Workspace::new(width, height, gap, 10),
+                Workspace::new(Position::new(0, 25, width, height), gap, 1),
+                Workspace::new(Position::new(0, 25, width, height), gap, 2),
+                Workspace::new(Position::new(0, 25, width, height), gap, 3),
+                Workspace::new(Position::new(0, 25, width, height), gap, 4),
+                Workspace::new(Position::new(0, 25, width, height), gap, 5),
+                Workspace::new(Position::new(0, 25, width, height), gap, 6),
+                Workspace::new(Position::new(0, 25, width, height), gap, 7),
+                Workspace::new(Position::new(0, 25, width, height), gap, 8),
+                Workspace::new(Position::new(0, 25, width, height), gap, 9),
+                Workspace::new(Position::new(0, 25, width, height), gap, 10),
             ],
             global_windows: vec![],
             focused_window: None,
@@ -77,7 +83,8 @@ impl Screen {
         ewmh::set_number_of_desktops(10, root_window, &atoms, &me.connection)?;
         me.switch_workspace(1)?;
 
-        me.update_atoms();
+        me.size_updated();
+        _ = me.update_atoms();
         Ok(me)
     }
 
@@ -113,7 +120,7 @@ impl Screen {
                 &self.connection,
             );
         }
-        self.update_atoms();
+        _ = self.update_atoms();
     }
 
     pub fn add_reserved_client(&mut self, client: ReservedClient) -> anyhow::Result<()> {
@@ -121,12 +128,15 @@ impl Screen {
             error!("Tried to register >255 global clients!");
             anyhow::bail!("Not supporting >255 global clients!");
         }
-        _ = self
-            .connection
-            .send_and_check_request(&ChangeWindowAttributes {
+        let map_cookie = self.connection.send_request_checked(&MapWindow { window: client.window });
+        let change_attributes_cookie = self.connection
+            .send_request_checked(&ChangeWindowAttributes {
                 window: client.window,
                 value_list: &[Cw::EventMask(EventMask::ENTER_WINDOW)],
             });
+        
+        self.connection.check_request(map_cookie)?;
+        self.connection.check_request(change_attributes_cookie)?;
         self.global_windows.push(client);
         self.update_atoms()?;
         Ok(())
@@ -191,7 +201,7 @@ impl Screen {
         } else {
             for reserved_client in self.global_windows.iter() {
                 if reserved_client.window == client {
-                    self.connection.send_request(&SetInputFocus {
+                    _ = self.connection.send_and_check_request(&SetInputFocus {
                         time: CURRENT_TIME,
                         focus: reserved_client.window,
                         revert_to: xcb::x::InputFocus::Parent,
@@ -203,9 +213,16 @@ impl Screen {
         }
     }
 
-    pub fn remove_window(&mut self, window: XWindow) {
-        println!("Destroying {window:?}");
+    fn free_reserved_space(&mut self, amount: u16, direction: ScreenSide) {
+        match direction {
+            ScreenSide::Bottom => self.free_space_bottom(amount),
+            ScreenSide::Left => self.free_space_left(amount),
+            ScreenSide::Right => self.free_space_right(amount),
+            ScreenSide::Top => self.free_space_top(amount),
+        }
+    }
 
+    pub fn remove_window(&mut self, window: XWindow) {
         for workspace in self.workspaces.iter_mut() {
             for client in workspace
                 .remove_window(|client| client.window == window, &self.connection)
@@ -220,10 +237,11 @@ impl Screen {
             let i = len - 1 - i;
             if self.global_windows[i].window == window {
                 let child = self.global_windows.remove(i);
-                self.connection.send_request(&UnmapWindow {
+                self.free_reserved_space(child.reserved, child.direction);
+                _ = self.connection.send_and_check_request(&UnmapWindow {
                     window: child.window,
                 });
-                self.connection.send_request(&DestroyWindow {
+                _ = self.connection.send_and_check_request(&DestroyWindow {
                     window: child.window,
                 });
             }
@@ -232,8 +250,143 @@ impl Screen {
         trace_result!(self.connection.flush(); "failed to flush the connection after window remove");
     }
 
+    fn handle_reserved_client(&mut self, window: XWindow, values: [u32; 12]) -> anyhow::Result<()> {
+        // _NET_WM_STRUT: https://specifications.freedesktop.org/wm-spec/latest/ar01s05.html#id-1.6.10
+        // _NET_WM_STRUT_PARTIAL: https://specifications.freedesktop.org/wm-spec/latest/ar01s05.html#id-1.6.11
+        let left = values[0];
+        let right = values[1];
+        let top = values[2];
+        let bottom = values[3];
+        let left_start_y = values[4];
+        let left_end_y = values[5];
+        let right_start_y = values[6];
+        let right_end_y = values[7];
+        let top_start_x = values[8];
+        let top_end_x = values[9];
+        let bottom_start_x = values[10];
+        let bottom_end_x = values[11];
+
+        let (position, direction, reserved) = if left > 0 {
+            self.reserve_space_left(left as u16);
+            (
+                Position {
+                    x: 0,
+                    y: left_start_y as u16,
+                    width: left as u16,
+                    height: (left_end_y - left_start_y) as u16,
+                },
+                ScreenSide::Left,
+                left as u16,
+            )
+        } else if bottom > 0 {
+            self.reserve_space_bottom(bottom as u16);
+            (
+                Position {
+                    x: bottom_start_x as u16,
+                    y: self.height - bottom as u16,
+                    width: (bottom_end_x - bottom_start_x) as u16,
+                    height: bottom as u16,
+                },
+                ScreenSide::Bottom,
+                bottom as u16,
+            )
+        } else if top > 0 {
+            self.reserve_space_top(top as u16);
+            (
+                Position {
+                    x: top_start_x as u16,
+                    y: 0,
+                    width: (top_end_x - top_start_x) as u16,
+                    height: top as u16,
+                },
+                ScreenSide::Top,
+                top as u16,
+            )
+        } else if right > 0 {
+            self.reserve_space_right(right as u16);
+            (
+                Position {
+                    x: self.width - right as u16,
+                    y: right_start_y as u16,
+                    width: right as u16,
+                    height: (right_end_y - right_start_y) as u16,
+                },
+                ScreenSide::Right,
+                right as u16,
+            )
+        } else {
+            anyhow::bail!(
+                "Invalid _NET_WM_STRUT/_NET_WM_STRUT_PARTIAL values: [left,right,top,bottom]=0"
+            );
+        };
+
+        if let Err(e) = self.add_reserved_client(ReservedClient {
+            window,
+            direction,
+            position,
+            reserved,
+        }) {
+            self.free_reserved_space(reserved, direction);
+
+            Err(e)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn add_window(&mut self, window: XWindow) -> anyhow::Result<()> {
-        println!("Adding window {window:?}");
+        // checking for strut and partial strut
+        {
+            let strut_partial_cookie = self.connection.send_request(&xcb::x::GetProperty {
+                delete: false,
+                window,
+                property: self.atoms.net_wm_strut_partial,
+                r#type: ATOM_CARDINAL,
+                long_offset: 0,
+                long_length: 12,
+            });
+            let strut_cookie = self.connection.send_request(&xcb::x::GetProperty {
+                delete: false,
+                window,
+                property: self.atoms.net_wm_strut,
+                r#type: ATOM_CARDINAL,
+                long_offset: 0,
+                long_length: 4,
+            });
+
+            if let Some(values) = self
+                .connection
+                .wait_for_reply(strut_partial_cookie)?
+                .value::<u32>()
+                .get(0..12)
+            {
+                self.handle_reserved_client(
+                    window,
+                    values
+                        .try_into()
+                        .context("strut_partial_cookie returned in invalid value")?,
+                )?;
+                self.update_atoms();
+                return Ok(());
+            }
+            if let Some(values) = self
+                .connection
+                .wait_for_reply(strut_cookie)?
+                .value::<u32>()
+                .get(0..4)
+            {
+                self.handle_reserved_client(
+                    window,
+                    [
+                        values[0], values[1], values[2], values[3], 0, 0, 0, 0, 0, 0, 0, 0,
+                    ],
+                )?;
+                self.update_atoms();
+                return Ok(());
+            }
+        }
+
+        // if we have neither of those elements
         let client = Client::new(window, self.root_window, &self.connection)?;
         self.window_lookup
             .insert(client.frame, self.current_workspace);
@@ -260,7 +413,8 @@ impl Screen {
                         &self.atoms,
                         &self.connection,
                     ) {
-                        self.global_windows.remove(i);
+                        let client = self.global_windows.remove(i);
+                        self.free_reserved_space(client.reserved, client.direction);
                     }
                 }
             }
@@ -321,6 +475,12 @@ impl Screen {
             _ = self.connection.check_request(cookie);
         }
     }
+
+    // pub fn draw_bar(&mut self) {
+    //     _ = self.draw.draw_rect(Position::new(0, 0, self.width, 25), config::BORDER_COLOR_ACTIVE, config::BORDER_COLOR_ACTIVE);
+    //     _ = self.draw.draw_string(10, 15, "Xephyr on :1.0", 0xffffffff, config::BORDER_COLOR_ACTIVE);
+    //     _ = self.draw.finalise();
+    // }
 }
 
 // reserve_space_DIR/free_space_DIR
@@ -345,23 +505,24 @@ impl Screen {
 
     // free
     pub fn free_space_top(&mut self, amount: u16) {
-        self.reserved_space_top += amount;
+        self.reserved_space_top -= amount;
         self.size_updated();
     }
     pub fn free_space_bottom(&mut self, amount: u16) {
-        self.reserved_space_bottom += amount;
+        self.reserved_space_bottom -= amount;
         self.size_updated();
     }
     pub fn free_space_left(&mut self, amount: u16) {
-        self.reserved_space_left += amount;
+        self.reserved_space_left -= amount;
         self.size_updated();
     }
     pub fn free_space_right(&mut self, amount: u16) {
-        self.reserved_space_right += amount;
+        self.reserved_space_right -= amount;
         self.size_updated();
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum ScreenSide {
     Top,
     Bottom,
@@ -482,10 +643,10 @@ impl AbstractWindow for Client {
 
     fn hide(&mut self, conn: &Connection) {
         self.visible = false;
-        conn.send_request(&UnmapWindow {
+        _ = conn.send_and_check_request(&UnmapWindow {
             window: self.window,
         });
-        conn.send_request(&UnmapWindow { window: self.frame });
+        _ = conn.send_and_check_request(&UnmapWindow { window: self.frame });
     }
 
     fn show(&mut self, conn: &Connection) {

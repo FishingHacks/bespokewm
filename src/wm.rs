@@ -1,13 +1,17 @@
-use std::{process::Command, sync::Arc};
+use std::{
+    process::{Command, Stdio},
+    sync::{mpsc::RecvTimeoutError, Arc},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use tracing::error;
 use xcb::{
     x::{
-        ChangeWindowAttributes, CreateGlyphCursor, Cw, Drawable, Event as XEvent, EventMask,
-        GetGeometry, OpenFont, Window,
+        ChangeWindowAttributes, CreateGlyphCursor, Cw, DestroyWindow, Drawable, Event as XEvent,
+        EventMask, GetGeometry, OpenFont, Window,
     },
-    Connection, Event as XcbEvent,
+    Connection, Event as XcbEvent, Xid,
 };
 
 use crate::{
@@ -32,7 +36,7 @@ impl Wm {
             .context("Failed to connect to the X Server. Is $DISPLAY correct?")?;
         let conn = Arc::new(conn);
 
-        let root = Self::setup(&conn)?;
+        let (root, root_depth) = Self::setup(&conn)?;
         let atoms = Atoms::get(&conn);
 
         let root_dimensions = request_sync!(conn => GetGeometry { drawable: Drawable::Window(root) }; "failed to get the initial window size");
@@ -59,6 +63,7 @@ impl Wm {
             atoms,
             root,
             conn.clone(),
+            root_depth,
         )
         .context("Failed to initialise the screen")?;
 
@@ -71,7 +76,8 @@ impl Wm {
         })
     }
 
-    fn setup(conn: &Connection) -> Result<Window> {
+    // returns the root window and the depth
+    fn setup(conn: &Connection) -> Result<(Window, u8)> {
         let setup = conn.get_setup();
         let screen = setup.roots().next().context("Failed to get a screen")?;
         let window = screen.root();
@@ -117,57 +123,92 @@ impl Wm {
         })
         .context("Failed to acquire root window")?;
 
-        Ok(window)
+        Ok((window, screen.root_depth()))
     }
 
     pub fn run(&mut self, actions: &[Action]) -> anyhow::Result<()> {
         let bound_actions = self.keyboard.bind_actions(actions, &self.conn, self.root);
         println!("{bound_actions:?}");
         let mut procs = vec![];
+        let (event_transmitter, event_receiver) = std::sync::mpsc::channel();
+        println!("{:?}", self.atoms);
+
+        // self.screen.draw_bar();
+
+        {
+            let conn = self.conn.clone();
+            std::thread::spawn(move || loop {
+                match conn.wait_for_event() {
+                    Ok(ev) => {
+                        println!("{ev:?}");
+                        if let Err(_) = event_transmitter.send(ev) {
+                            drop(event_transmitter);
+                            std::process::abort();
+                        }
+                    },
+                    Err(e) => {
+                        println!("{e:?}");
+                        drop(event_transmitter);
+                        std::process::abort();
+                    }
+                }
+            });
+        };
 
         'mainloop: loop {
-            let ev = self
-                .conn
-                .wait_for_event()
-                .context("Ran into an error while trying to fetch the next event")?;
-            let Some(ev) = self.translate_event(ev) else {
-                continue;
+            // wait half a second for each thread before updating the status bar
+            let ev = match event_receiver.recv_timeout(Duration::from_millis(500)) {
+                Ok(v) => Some(v),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break 'mainloop,
             };
 
-            match ev {
-                Event::KeyPress(ev) => {
-                    println!("{ev:?}");
-                    for action in bound_actions.iter() {
-                        if action.key == ev.keycode && action.modifiers == ev.mods {
-                            match actions[action.action_index].action {
-                                ActionType::Quit => break 'mainloop,
-                                ActionType::CycleLayout => self.screen.cycle_layout(),
-                                ActionType::CloseFocusedWindow => self.screen.close_focused_window(),
-                                ActionType::SwitchToLayout(new_layout) => {
-                                    self.screen.set_layout(new_layout)
-                                }
-                                ActionType::Launch(cmd) => {
-                                    let mut command = Command::new(cmd);
-                                    if let Some(display) = std::env::var_os("DISPLAY")
-                                        .and_then(|str| str.into_string().ok())
-                                    {
-                                        command.env("DISPLAY", display);
+            if let Some(ev) = self.translate_event(ev) {
+                match ev {
+                    Event::KeyPress(ev) => {
+                        for action in bound_actions.iter() {
+                            if action.key == ev.keycode && action.modifiers == ev.mods {
+                                match actions[action.action_index].action {
+                                    ActionType::Quit => break 'mainloop,
+                                    ActionType::CycleLayout => self.screen.cycle_layout(),
+                                    ActionType::CloseFocusedWindow => {
+                                        self.screen.close_focused_window()
                                     }
-                                    match command.spawn() {
-                                        Err(e) => {
-                                            error!("Failed to run Action: Failed to run Command: {e:?}")
+                                    ActionType::SwitchToLayout(new_layout) => {
+                                        self.screen.set_layout(new_layout)
+                                    }
+                                    ActionType::Launch(cmd) => {
+                                        let mut command = Command::new(cmd);
+                                        command
+                                            .stdin(Stdio::null())
+                                            .stdout(Stdio::null())
+                                            .stderr(Stdio::null());
+                                        if let Some(display) = std::env::var_os("DISPLAY")
+                                            .and_then(|str| str.into_string().ok())
+                                        {
+                                            command.env("DISPLAY", display);
                                         }
-                                        Ok(child) => procs.push(child),
+                                        match command.spawn() {
+                                            Err(e) => {
+                                                error!("Failed to run Action: Failed to run Command: {e:?}")
+                                            }
+                                            Ok(child) => procs.push(child),
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                    Event::MapRequest(window) => {
+                        if let Err(e) = self.screen.add_window(window) {
+                            error!("Failed to map window({}): {e:?}", window.resource_id());
+                            _ = self.conn.send_and_check_request(&DestroyWindow { window });
+                        }
+                    }
+                    Event::DestroyNotify(window) => self.screen.remove_window(window),
+                    Event::EnterNotify(window) => self.screen.enter_client(window),
+                    _ => {}
                 }
-                Event::MapRequest(window) => trace_result!(self.screen.add_window(window)),
-                Event::DestroyNotify(window) => self.screen.remove_window(window),
-                Event::EnterNotify(window) => self.screen.enter_client(window),
-                _ => {}
             }
 
             // clean up child processes
@@ -179,6 +220,8 @@ impl Wm {
                     procs.remove(i);
                 }
             }
+
+            // self.screen.draw_bar();
         }
 
         self.keyboard
@@ -191,8 +234,8 @@ impl Wm {
         Ok(())
     }
 
-    fn translate_event(&self, event: xcb::Event) -> Option<Event> {
-        match event {
+    fn translate_event(&self, event: Option<xcb::Event>) -> Option<Event> {
+        match event? {
             XcbEvent::X(XEvent::KeyPress(event)) => {
                 Some(self.keyboard.translate_event(event, true))
             }

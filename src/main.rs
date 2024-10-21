@@ -31,6 +31,7 @@ macro_rules! request_sync {
     };
 }
 
+pub mod drawing;
 pub mod actions;
 pub mod ewmh;
 pub mod atoms;
