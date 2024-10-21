@@ -112,6 +112,7 @@ impl Wm {
                     EventMask::SUBSTRUCTURE_NOTIFY
                         | EventMask::SUBSTRUCTURE_REDIRECT
                         | EventMask::ENTER_WINDOW
+                        | EventMask::PROPERTY_CHANGE
                         | EventMask::KEY_PRESS
                         | EventMask::KEY_RELEASE
                         | EventMask::BUTTON_PRESS
@@ -140,12 +141,11 @@ impl Wm {
             std::thread::spawn(move || loop {
                 match conn.wait_for_event() {
                     Ok(ev) => {
-                        println!("{ev:?}");
                         if let Err(_) = event_transmitter.send(ev) {
                             drop(event_transmitter);
                             std::process::abort();
                         }
-                    },
+                    }
                     Err(e) => {
                         println!("{e:?}");
                         drop(event_transmitter);
@@ -269,6 +269,14 @@ impl Wm {
             XcbEvent::X(XEvent::MapRequest(ev)) => Some(Event::MapRequest(ev.window())),
             XcbEvent::X(XEvent::DestroyNotify(ev)) => Some(Event::DestroyNotify(ev.window())),
             XcbEvent::X(XEvent::ReparentNotify(_)) => None,
+            XcbEvent::X(XEvent::PropertyNotify(ev)) => {
+                println!(
+                    "Property changed for window {:?}: {:?}",
+                    ev.window(),
+                    ev.atom()
+                );
+                None
+            }
 
             XcbEvent::Xkb(xcb::xkb::Event::StateNotify(xkb_ev))
                 if xkb_ev.device_id() as i32 == self.keyboard.device_id() =>
@@ -276,7 +284,10 @@ impl Wm {
                 self.keyboard.update_state(xkb_ev);
                 None
             }
-            _ => None,
+            e => {
+                //println!("{e:?}");
+                None
+            }
         }
     }
 }

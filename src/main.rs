@@ -4,20 +4,20 @@ use wm::Wm;
 macro_rules! trace_result {
     ($value: expr) => {
         match $value {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(e) => {
                 error!("{e:?}");
             }
         }
     };
-    ($value: expr; $context: expr) => {
-        match $value.context($context) {
-            Ok(_) => {},
+    ($value: expr; $context: expr) => {{
+        match anyhow::Context::context($value, $context) {
+            Ok(_) => {}
             Err(e) => {
                 error!("{e:?}");
             }
         }
-    };
+    }};
 }
 
 macro_rules! request_sync {
@@ -31,15 +31,17 @@ macro_rules! request_sync {
     };
 }
 
-pub mod drawing;
 pub mod actions;
-pub mod ewmh;
 pub mod atoms;
 mod config;
+pub mod drawing;
 pub mod events;
+pub mod ewmh;
 pub mod keyboard;
 pub mod layout;
 pub mod screen;
+pub mod slab;
+pub mod tiling;
 mod wm;
 
 fn main() -> anyhow::Result<()> {

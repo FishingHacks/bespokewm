@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.86"
-raylib = "5.0.2"
 tracing = "0.1.40"
 tracing-appender = "0.2.3"
 tracing-subscriber = "0.3.18"
 xcb = { version = "1.4.0", features = ["xkb", "x11", "xlib_xcb", "as-raw-xcb-connection", "randr", "xinput"] }
+x11 = "2.21.0"
 xkbcommon = { version = "0.8.0", features = ["x11"] }

@@ -8,7 +8,7 @@ use xcb::{
     Connection, Xid,
 };
 
-use crate::{atoms::Atoms, layout::Workspace, screen::Client};
+use crate::{atoms::Atoms, layout::Workspace, screen::Context};
 type EwmhResult = anyhow::Result<(), xcb::ProtocolError>;
 
 macro_rules! change_property {
@@ -56,7 +56,7 @@ pub fn set_current_desktop(
 }
 
 pub fn set_desktop_names(
-    workspaces: &[Workspace<Client>],
+    workspaces: &[Workspace],
     root: Window,
     atoms: &Atoms,
     conn: &Connection,
@@ -100,19 +100,15 @@ pub fn set_desktop_viewport(
 
 /// updates _NET_WM_DESKTOP for all clients on all workspaces for the
 /// current screen
-pub fn set_wm_desktop(
-    workspaces: &[Workspace<Client>],
-    atoms: &Atoms,
-    conn: &Connection,
-) -> EwmhResult {
+pub fn set_wm_desktop(workspaces: &[Workspace], ctx: &Context) -> EwmhResult {
     for workspace in workspaces.iter() {
         for client in workspace.windows() {
             change_property!(
-                conn,
-                client.window,
+                ctx.connection,
+                ctx.windows[client].window,
                 PropMode::Replace,
                 ATOM_CARDINAL,
-                atoms.net_wm_desktop,
+                ctx.atoms.net_wm_desktop,
                 &[workspace.id()]
             )?;
         }
@@ -123,7 +119,7 @@ pub fn set_wm_desktop(
 /// list all the clients currently managed by the window manager
 /// by order of insertion
 pub fn set_client_list<'a>(
-    clients: impl IntoIterator<Item = &'a Window>,
+    clients: &[Window],
     root: Window,
     atoms: &Atoms,
     conn: &Connection,
@@ -134,7 +130,7 @@ pub fn set_client_list<'a>(
         PropMode::Replace,
         ATOM_WINDOW,
         atoms.net_client_list,
-        &clients.into_iter().copied().collect::<Vec<_>>()
+        clients,
     )
 }
 
@@ -142,7 +138,7 @@ pub fn set_client_list<'a>(
 /// by stacking order, since we dont stack windows, this is the same
 /// as the other list
 pub fn set_client_list_stacking<'a>(
-    clients: impl IntoIterator<Item = &'a Window>,
+    clients: &[Window],
     root: Window,
     atoms: &Atoms,
     conn: &Connection,
@@ -153,7 +149,7 @@ pub fn set_client_list_stacking<'a>(
         PropMode::Replace,
         ATOM_WINDOW,
         atoms.net_client_list_stacking,
-        &clients.into_iter().copied().collect::<Vec<_>>()
+        clients,
     )
 }
 

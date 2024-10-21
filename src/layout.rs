@@ -1,255 +1,8 @@
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 
-use xcb::{x::Rectangle, Connection};
+use xcb::x::Rectangle;
 
-pub trait AbstractWindow: Debug + Eq + Copy {
-    fn update(&mut self, width: u16, height: u16, x: u16, y: u16, conn: &Connection);
-    fn hide(&mut self, conn: &Connection);
-    fn show(&mut self, conn: &Connection);
-    fn focus(&mut self, conn: &Connection);
-    fn unfocus(&mut self, conn: &Connection);
-    fn destroy(&mut self, conn: &Connection);
-    /// Requests a window delete
-    /// If this function returns true, it means we have
-    /// removed the window and not just scheduled a delete
-    /// Thus we need to remove the window from all relevant places
-    fn close(&mut self, atoms: &crate::atoms::Atoms, conn: &Connection) -> bool;
-}
-#[derive(Debug)]
-pub struct ClientWindow<T: AbstractWindow> {
-    data: T,
-    width: u16,
-    height: u16,
-    x: u16,
-    y: u16,
-}
-impl<T: AbstractWindow> ClientWindow<T> {
-    fn update(&mut self, width: u16, height: u16, x: u16, y: u16, conn: &Connection) {
-        self.x = x;
-        self.y = y;
-        self.width = width;
-        self.height = height;
-        self.data.update(width, height, x, y, conn);
-    }
-
-    fn new(data: T) -> Self {
-        Self {
-            data,
-            x: 0,
-            y: 0,
-            width: 0,
-            height: 0,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Layout {
-    Grid,
-    MasterLeft,
-    MasterRight,
-    MasterLeftGrid,
-    MasterRightGrid,
-    Monocle,
-}
-
-impl Display for Layout {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Grid => "HHH",
-            Self::MasterLeft => "[]=",
-            Self::MasterRight => "=[]",
-            Self::MasterLeftGrid => "[]H",
-            Self::MasterRightGrid => "H[]",
-            Self::Monocle => "[M]",
-        })
-    }
-}
-
-impl Layout {
-    /// ASSUMPTIONS: windows.len() >= 1
-    fn retile_grid<T: AbstractWindow>(
-        windows: &mut [ClientWindow<T>],
-        gap: u16,
-        screen_position: Position,
-        conn: &Connection,
-    ) {
-        let half_gap = gap / 2;
-
-        let num_wins_horz = (windows.len() as f64).sqrt().ceil() as u16;
-        let num_wins_vert = windows.len().div_ceil(num_wins_horz as usize) as u16;
-
-        let win_width = screen_position.width / num_wins_horz;
-        let win_height = screen_position.height / num_wins_vert;
-
-        let offset_x = half_gap + screen_position.x;
-        let offset_y = half_gap + screen_position.y;
-
-        let len = windows.len();
-        for i in 0..windows.len() {
-            let x = (i as u16 % num_wins_horz) * win_width + offset_x;
-            let y = (i as u16 / num_wins_horz) * win_height + offset_y;
-
-            let i = len - 1 - i;
-            windows[i].update(win_width - gap, win_height - gap, x, y, conn);
-        }
-    }
-
-    /// ASSUMPTIONS: windows.len() >= 1
-    fn retile_with_master<T: AbstractWindow>(
-        windows: &mut [ClientWindow<T>],
-        gap: u16,
-        screen_position: Position,
-        master_is_left: bool,
-        conn: &Connection,
-    ) {
-        let half_gap = gap / 2;
-        let half_width = screen_position.width / 2;
-
-        // we do -1 because that later excludes the last element and is the last element
-        let len = windows.len() - 1;
-        windows[len].update(
-            half_width - gap,
-            screen_position.height - gap,
-            if master_is_left {
-                half_gap
-            } else {
-                half_width + half_gap
-            } + screen_position.x,
-            half_gap + screen_position.y,
-            conn,
-        );
-
-        let width = half_width - gap;
-        let height_gapless = screen_position.height / len as u16;
-        let height = height_gapless - gap;
-        let x = if master_is_left {
-            half_width + half_gap
-        } else {
-            half_gap
-        } + screen_position.x;
-
-        for i in 0..len {
-            windows[len - 1 - i].update(
-                width,
-                height,
-                x,
-                i as u16 * height_gapless + half_gap + screen_position.y,
-                conn,
-            );
-        }
-    }
-
-    /// ASSUMPTIONS: windows.len() >= 1
-    fn retile_with_master_grid<T: AbstractWindow>(
-        windows: &mut [ClientWindow<T>],
-        gap: u16,
-        screen_position: Position,
-        master_is_left: bool,
-        conn: &Connection,
-    ) {
-        let half_gap = gap / 2;
-        let half_width = screen_position.width / 2;
-
-        // we do -1 because that later excludes the last element and is the last element
-        let len = windows.len() - 1;
-        windows[len].update(
-            half_width - gap,
-            screen_position.height - gap,
-            if master_is_left {
-                half_gap
-            } else {
-                half_width + half_gap
-            } + screen_position.x,
-            half_gap + screen_position.y,
-            conn,
-        );
-
-        if master_is_left {
-            Self::retile_grid(
-                &mut windows[0..len],
-                gap,
-                Position::new(
-                    half_width + screen_position.x,
-                    screen_position.y,
-                    half_width,
-                    screen_position.height,
-                ),
-                conn,
-            );
-        } else {
-            Self::retile_grid(
-                &mut windows[0..len],
-                gap,
-                Position::new(
-                    screen_position.x,
-                    screen_position.y,
-                    half_width,
-                    screen_position.height,
-                ),
-                conn,
-            );
-        }
-    }
-
-    fn retile_monocle<T: AbstractWindow>(
-        windows: &mut [ClientWindow<T>],
-        gap: u16,
-        screen_position: Position,
-        conn: &Connection,
-    ) {
-        let len = windows.len() - 1;
-
-        let x = screen_position.x + gap / 2;
-        let y = screen_position.y + gap / 2;
-
-        for window in windows[0..len].iter_mut() {
-            window.update(30, 30, x, y, conn);
-        }
-
-        windows[len].update(
-            screen_position.width - gap,
-            screen_position.height - gap,
-            x,
-            y,
-            conn,
-        );
-    }
-
-    fn retile<T: AbstractWindow>(self, tiler: &mut Workspace<T>, conn: &Connection) {
-        if tiler.windows.len() < 1 {
-            return;
-        } else if tiler.windows.len() == 1 {
-            // the window is always gonna be the entire window
-            tiler.windows[0].update(
-                tiler.pos.width - tiler.gap,
-                tiler.pos.height - tiler.gap,
-                tiler.gap / 2 + tiler.pos.x,
-                tiler.gap / 2 + tiler.pos.y,
-                conn,
-            );
-
-            return;
-        }
-
-        match self {
-            Self::Grid => Self::retile_grid(&mut tiler.windows, tiler.gap, tiler.pos, conn),
-            Self::MasterLeft => {
-                Self::retile_with_master(&mut tiler.windows, tiler.gap, tiler.pos, true, conn)
-            }
-            Self::MasterRight => {
-                Self::retile_with_master(&mut tiler.windows, tiler.gap, tiler.pos, false, conn)
-            }
-            Self::MasterLeftGrid => {
-                Self::retile_with_master_grid(&mut tiler.windows, tiler.gap, tiler.pos, true, conn)
-            }
-            Self::MasterRightGrid => {
-                Self::retile_with_master_grid(&mut tiler.windows, tiler.gap, tiler.pos, false, conn)
-            }
-            Self::Monocle => Self::retile_monocle(&mut tiler.windows, tiler.gap, tiler.pos, conn),
-        }
-    }
-}
+use crate::{screen::Context, tiling::Layout};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
@@ -281,19 +34,19 @@ impl Into<Rectangle> for Position {
 }
 
 #[derive(Debug)]
-pub struct Workspace<T: AbstractWindow> {
-    windows: Vec<ClientWindow<T>>,
-    floating_windows: Vec<ClientWindow<T>>,
+pub struct Workspace {
+    pub windows: Vec<usize>,
+    floating_windows: Vec<usize>,
     pos: Position,
     gap: u16,
     layout: Layout,
     is_showing: bool,
     name: String,
     id: u32,
-    focused: Option<T>,
+    focused: Option<(usize, bool)>,
 }
 
-impl<T: AbstractWindow> Workspace<T> {
+impl Workspace {
     pub fn new(pos: Position, gap: u16, id: u32) -> Self {
         Self {
             windows: vec![],
@@ -308,38 +61,40 @@ impl<T: AbstractWindow> Workspace<T> {
         }
     }
 
-    fn retile(&mut self, conn: &Connection) {
+    fn retile(&mut self, context: &mut Context) {
         if self.windows.len() > 0 && self.is_showing {
-            self.layout.retile(self, conn);
+            self.layout
+                .retile(&self.windows, self.gap, self.pos, context);
         }
     }
 
-    pub fn show(&mut self, conn: &Connection) {
+    pub fn show(&mut self, ctx: &mut Context) {
         self.is_showing = true;
 
-        for win in self.windows.iter_mut() {
-            win.data.show(conn);
+        for win in self.windows.iter().copied() {
+            ctx.windows[win].show(&ctx.connection);
         }
-        self.retile(conn);
+        self.retile(ctx);
 
-        for win in self.windows.iter_mut() {
-            win.data.show(conn);
-            win.data.update(win.width, win.height, win.x, win.y, conn);
+        for win in self.windows.iter().copied() {
+            let win = &mut ctx.windows[win];
+            win.show(&ctx.connection);
+            win.update(win.width, win.height, win.x, win.y, &ctx.connection);
         }
     }
 
-    pub fn hide(&mut self, conn: &Connection) {
+    pub fn hide(&mut self, ctx: &mut Context) {
         self.is_showing = false;
-        self.unfocus_all(conn);
-        for win in self.windows.iter_mut() {
-            win.data.hide(conn);
+        self.unfocus_all(ctx);
+        for win in self.windows.iter().copied() {
+            ctx.windows[win].hide(&ctx.connection);
         }
-        for win in self.floating_windows.iter_mut() {
-            win.data.hide(conn);
+        for win in self.floating_windows.iter().copied() {
+            ctx.windows[win].hide(&ctx.connection);
         }
     }
 
-    pub fn cycle_layout(&mut self, conn: &Connection) {
+    pub fn cycle_layout(&mut self, ctx: &mut Context) {
         self.layout = match self.layout {
             Layout::Grid => Layout::MasterLeft,
             Layout::MasterLeft => Layout::MasterRight,
@@ -349,44 +104,48 @@ impl<T: AbstractWindow> Workspace<T> {
             Layout::Monocle => Layout::Grid,
         };
 
-        self.retile(conn);
+        self.retile(ctx);
     }
 
-    pub fn set_layout(&mut self, new_layout: Layout, conn: &Connection) {
+    pub fn set_layout(&mut self, new_layout: Layout, ctx: &mut Context) {
         if self.layout == new_layout {
             return;
         }
         self.layout = new_layout;
 
-        self.retile(conn);
+        self.retile(ctx);
     }
 
-    pub fn spawn_window(&mut self, mut data: T, conn: &Connection) {
-        data.show(conn);
-
-        self.windows.push(ClientWindow::new(data));
-        self.retile(conn);
+    pub fn spawn_window(&mut self, index: usize, ctx: &mut Context) {
+        ctx.windows[index].show(&ctx.connection);
+        self.windows.push(index);
+        self.retile(ctx);
     }
 
     /// finds the window to toggle floating on. Usize is the window index and the boolean is if it is currently not floating
-    fn find_floating_window(&mut self, window: &T) -> Option<(usize, bool)> {
+    fn find_floating_window(&mut self, window_idx: usize) -> Option<(usize, bool)> {
         for i in 0..self.windows.len() {
-            if self.windows[i].data.eq(window) {
+            if self.windows[i] == window_idx {
                 return Some((i, true));
             }
         }
         for i in 0..self.floating_windows.len() {
-            if self.floating_windows[i].data.eq(window) {
+            if self.floating_windows[i] == window_idx {
                 return Some((i, false));
             }
         }
         None
     }
 
-    pub fn toggle_floating(&mut self, window: &T, conn: &Connection) {
-        let Some((idx, enable)) = self.find_floating_window(window) else {
+    pub fn toggle_floating(&mut self, window_idx: usize, ctx: &mut Context) {
+        let Some((idx, enable)) = self.find_floating_window(window_idx) else {
             return;
         };
+        if let Some((idx, _)) = self.focused {
+            if idx == window_idx {
+                self.focused = Some((idx, !enable));
+            }
+        }
 
         if enable {
             let val = self.windows.remove(idx);
@@ -396,101 +155,70 @@ impl<T: AbstractWindow> Workspace<T> {
             self.windows.push(val);
         }
 
-        self.retile(conn);
+        self.retile(ctx);
     }
 
-    pub fn remove_window(&mut self, predicate: impl Fn(&T) -> bool, conn: &Connection) -> Vec<T> {
-        let mut removed: Vec<T> = vec![];
-        self.unfocus(&predicate, conn);
+    pub fn remove_window(&mut self, window_idx: usize, ctx: &mut Context) {
+        self.unfocus(window_idx, ctx);
 
         let len = self.windows.len();
         for i in 0..self.windows.len() {
             let i = len - 1 - i;
-            if predicate(&self.windows[i].data) {
-                self.windows[i].data.destroy(conn);
-                removed.push(self.windows.remove(i).data);
+            if self.windows[i] == window_idx {
+                if let Some((idx, false)) = self.focused {
+                    if idx > i {
+                        self.focused = Some((idx - 1, false));
+                    }
+                }
+                self.windows.remove(i);
             }
         }
 
         let len = self.floating_windows.len();
         for i in 0..self.floating_windows.len() {
             let i = len - 1 - i;
-            if predicate(&self.floating_windows[i].data) {
-                self.floating_windows[i].data.destroy(conn);
-                removed.push(self.floating_windows.remove(i).data);
+            if self.floating_windows[i] == window_idx {
+                if let Some((idx, true)) = self.focused {
+                    if idx > i {
+                        self.focused = Some((idx - 1, true));
+                    }
+                }
+                self.floating_windows.remove(i);
             }
         }
 
-        if removed.len() > 0 {
-            self.retile(conn);
-        }
-
-        removed
+        self.retile(ctx);
     }
 
-    /// Requests a window delete
-    /// Returns all removed clients
-    pub fn close_window(
-        &mut self,
-        predicate: impl Fn(&T) -> bool,
-        atoms: &crate::atoms::Atoms,
-        conn: &Connection,
-    ) -> Vec<T> {
-        let mut clients = vec![];
-        self.unfocus(&predicate, conn);
-
-        let len = self.windows.len();
-        for i in 0..len {
-            let i = len - 1 - i;
-            if predicate(&self.windows[i].data) {
-                if self.windows[i].data.close(atoms, conn) {
-                    clients.push(self.windows.remove(i).data);
-                }
-            }
-        }
-
-        let len = self.floating_windows.len();
-        for i in 0..len {
-            let i = len - 1 - i;
-            if predicate(&self.floating_windows[i].data) {
-                if self.floating_windows[i].data.close(atoms, conn) {
-                    clients.push(self.floating_windows.remove(i).data);
-                }
-            }
-        }
-
-        clients
-    }
-
-    pub fn set_screen_size(&mut self, width: u16, height: u16, conn: &Connection) {
+    pub fn set_screen_size(&mut self, width: u16, height: u16, ctx: &mut Context) {
         self.pos.width = width;
         self.pos.height = height;
 
-        self.retile(conn);
+        self.retile(ctx);
     }
 
-    pub fn set_screen_offset(&mut self, offset_x: u16, offset_y: u16, conn: &Connection) {
+    pub fn set_screen_offset(&mut self, offset_x: u16, offset_y: u16, ctx: &mut Context) {
         self.pos.x = offset_x;
         self.pos.y = offset_y;
 
-        self.retile(conn);
+        self.retile(ctx);
     }
 
-    pub fn set_screen_position(&mut self, pos: Position, conn: &Connection) {
+    pub fn set_screen_position(&mut self, pos: Position, ctx: &mut Context) {
         self.pos = pos;
 
-        self.retile(conn);
+        self.retile(ctx);
     }
 
     pub fn get_screen_position(&self) -> Position {
         self.pos
     }
 
-    pub fn windows(&self) -> impl Iterator<Item = &T> {
+    pub fn windows<'a>(&'a self) -> impl Iterator<Item = usize> + 'a {
         self.windows
             .iter()
             .chain(self.floating_windows.iter())
-            .map(|el| &el.data)
+            .copied()
     }
 
     pub fn id(&self) -> u32 {
@@ -501,40 +229,67 @@ impl<T: AbstractWindow> Workspace<T> {
         &self.name
     }
 
-    pub fn find_client(&self, predicate: impl Fn(&T) -> bool) -> Option<&T> {
-        for window in self.windows.iter() {
-            if predicate(&window.data) {
-                return Some(&window.data);
+    fn get_window(&self, window_idx: usize) -> Option<(usize, bool)> {
+        for idx in 0..self.windows.len() {
+            if self.windows[idx] == window_idx {
+                return Some((idx, false));
             }
         }
-        for window in self.floating_windows.iter() {
-            if predicate(&window.data) {
-                return Some(&window.data);
+        for idx in 0..self.floating_windows.len() {
+            if self.floating_windows[idx] == window_idx {
+                return Some((idx, true));
             }
         }
+
         None
     }
 
-    pub fn focus_client(&mut self, mut client: T, conn: &Connection) {
-        if let Some(mut focused) = self.focused.replace(client) {
-            focused.unfocus(conn);
+    pub fn focus_client(&mut self, window_idx: usize, ctx: &mut Context) -> bool {
+        if let Some((idx, is_floating)) = self.focused.take() {
+            let window_idx = if is_floating {
+                self.floating_windows[idx]
+            } else {
+                self.windows[idx]
+            };
+            ctx.windows[window_idx].unfocus(&ctx.connection);
         }
-        client.focus(conn);
+        self.focused = self.get_window(window_idx);
+
+        if let Some((idx, is_floating)) = self.focused {
+            let window_idx = if is_floating {
+                self.floating_windows[idx]
+            } else {
+                self.windows[idx]
+            };
+            ctx.windows[window_idx].focus(&ctx.connection);
+        }
+        self.focused.is_some()
     }
 
-    pub fn unfocus(&mut self, predicate: &dyn Fn(&T) -> bool, conn: &Connection) {
-        if let Some(focused) = self.focused.as_ref() {
-            if predicate(focused) {
-                if let Some(mut focused) = self.focused.take() {
-                    focused.unfocus(conn);
-                }
+    pub fn unfocus(&mut self, window_idx: usize, ctx: &mut Context) {
+        if let Some((idx, is_floating)) = self.focused {
+            let idx = if is_floating {
+                self.floating_windows[idx]
+            } else {
+                self.windows[idx]
+            };
+
+            if idx != window_idx {
+                return;
             }
+            ctx.windows[window_idx].unfocus(&ctx.connection);
+            self.focused = None;
         }
     }
 
-    pub fn unfocus_all(&mut self, conn: &Connection) {
-        if let Some(mut focused) = self.focused.take() {
-            focused.unfocus(conn);
+    pub fn unfocus_all(&mut self, ctx: &mut Context) {
+        if let Some((idx, is_floating)) = self.focused.take() {
+            let window_idx = if is_floating {
+                self.floating_windows[idx]
+            } else {
+                self.windows[idx]
+            };
+            ctx.windows[window_idx].unfocus(&ctx.connection);
         }
     }
 
@@ -542,5 +297,9 @@ impl<T: AbstractWindow> Workspace<T> {
         self.windows.clear();
         self.floating_windows.clear();
         self.focused = None;
+    }
+
+    pub(crate) fn window_amount(&self) -> usize {
+        self.windows.len() + self.floating_windows.len()
     }
 }

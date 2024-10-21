@@ -1,12 +1,18 @@
-use std::{collections::HashMap, sync::Arc};
+use core::str;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
-use anyhow::{Context, Result};
+const WINDOW_BAR_HEIGHT: u16 = 20;
+
+use anyhow::{Context as _, Result};
 use tracing::{error, warn};
 use xcb::{
     x::{
         ChangeWindowAttributes, ConfigWindow, ConfigureWindow, CreateWindow, Cw, DestroyWindow,
-        EventMask, MapWindow, ReparentWindow, SetInputFocus, UnmapWindow, Window as XWindow,
-        ATOM_CARDINAL, COPY_FROM_PARENT, CURRENT_TIME,
+        EventMask, GetProperty, GetPropertyReply, MapWindow, ReparentWindow, SetInputFocus,
+        UnmapWindow, Window as XWindow, ATOM_ANY, ATOM_CARDINAL, COPY_FROM_PARENT, CURRENT_TIME,
     },
     Connection, Xid,
 };
@@ -14,8 +20,20 @@ use xcb::{
 use crate::{
     atoms::Atoms,
     config, ewmh,
-    layout::{AbstractWindow, Layout, Position, Workspace},
+    layout::{Position, Workspace},
+    slab::Slab,
+    tiling::Layout,
 };
+
+pub struct Context {
+    pub(crate) window_lookup: HashMap<XWindow, usize>,
+    pub(crate) windows: Slab<Client>,
+    pub(crate) current_workspace: u8,
+    pub(crate) atoms: Atoms,
+    pub(crate) root_window: XWindow,
+    pub(crate) connection: Arc<Connection>,
+    pub(crate) focused_window: Option<usize>,
+}
 
 pub struct Screen {
     width: u16,
@@ -24,19 +42,10 @@ pub struct Screen {
     reserved_space_top: u16,
     reserved_space_left: u16,
     reserved_space_right: u16,
-    window_lookup: HashMap<XWindow, u8>,
+    workspaces: [Workspace; 10],
+    context: Context,
 
-    workspaces: [Workspace<Client>; 10],
-    global_windows: Vec<ReservedClient>,
-    current_workspace: u8,
-    atoms: Atoms,
-    root_window: XWindow,
-    connection: Arc<Connection>,
-
-    // draw: DrawContext,
-    /// Option<(window, frame)>
-    /// The frame may be Window(0) to indicate the window is a reserved client
-    focused_window: Option<(XWindow, XWindow)>,
+    global_windows: Slab<ReservedClient>,
 }
 
 impl Screen {
@@ -53,16 +62,12 @@ impl Screen {
         // draw.open_font("fixed")?;
 
         let mut me = Self {
-            atoms,
-            root_window,
-            connection,
             width,
             height,
             reserved_space_bottom: 0,
             reserved_space_left: 0,
             reserved_space_right: 0,
             reserved_space_top: 0,
-            window_lookup: Default::default(),
             // draw,
             workspaces: [
                 Workspace::new(Position::new(0, 25, width, height), gap, 1),
@@ -76,11 +81,18 @@ impl Screen {
                 Workspace::new(Position::new(0, 25, width, height), gap, 9),
                 Workspace::new(Position::new(0, 25, width, height), gap, 10),
             ],
-            global_windows: vec![],
-            focused_window: None,
-            current_workspace: 1,
+            global_windows: Slab::new(),
+            context: Context {
+                connection,
+                windows: Slab::new(),
+                window_lookup: HashMap::new(),
+                atoms,
+                root_window,
+                focused_window: None,
+                current_workspace: 0,
+            },
         };
-        ewmh::set_number_of_desktops(10, root_window, &atoms, &me.connection)?;
+        ewmh::set_number_of_desktops(10, root_window, &atoms, &me.context.connection)?;
         me.switch_workspace(1)?;
 
         me.size_updated();
@@ -117,7 +129,7 @@ impl Screen {
                     self.width - self.reserved_space_left - self.reserved_space_right,
                     self.height - self.reserved_space_top - self.reserved_space_bottom,
                 ),
-                &self.connection,
+                &mut self.context,
             );
         }
         _ = self.update_atoms();
@@ -128,87 +140,122 @@ impl Screen {
             error!("Tried to register >255 global clients!");
             anyhow::bail!("Not supporting >255 global clients!");
         }
-        let map_cookie = self.connection.send_request_checked(&MapWindow { window: client.window });
-        let change_attributes_cookie = self.connection
-            .send_request_checked(&ChangeWindowAttributes {
-                window: client.window,
-                value_list: &[Cw::EventMask(EventMask::ENTER_WINDOW)],
-            });
-        
-        self.connection.check_request(map_cookie)?;
-        self.connection.check_request(change_attributes_cookie)?;
+        let map_cookie = self.context.connection.send_request_checked(&MapWindow {
+            window: client.window,
+        });
+        let change_attributes_cookie =
+            self.context
+                .connection
+                .send_request_checked(&ChangeWindowAttributes {
+                    window: client.window,
+                    value_list: &[Cw::EventMask(EventMask::ENTER_WINDOW)],
+                });
+
+        self.context.connection.check_request(map_cookie)?;
+        self.context
+            .connection
+            .check_request(change_attributes_cookie)?;
         self.global_windows.push(client);
         self.update_atoms()?;
         Ok(())
     }
 
     pub fn switch_workspace(&mut self, new_workspace: u8) -> Result<(), xcb::ProtocolError> {
-        let old_workspace = self.current_workspace;
-        self.current_workspace = new_workspace;
+        let old_workspace = self.context.current_workspace;
+        self.context.current_workspace = new_workspace;
         self.update_atoms()?;
-        self.workspaces[old_workspace as usize].hide(&self.connection);
-        self.workspaces[new_workspace as usize].show(&self.connection);
+        self.workspaces[old_workspace as usize].hide(&mut self.context);
+        self.workspaces[new_workspace as usize].show(&mut self.context);
         Ok(())
     }
 
     pub fn update_atoms(&self) -> Result<(), xcb::ProtocolError> {
-        let atoms = &self.atoms;
-        let conn = &self.connection;
+        let atoms = &self.context.atoms;
+        let conn = &self.context.connection;
 
         ewmh::set_desktop_viewport(
             self.reserved_space_left as u32,
             self.reserved_space_top as u32,
-            self.root_window,
+            self.context.root_window,
             atoms,
             conn,
         )?;
-        ewmh::set_number_of_desktops(self.workspaces.len() as u32, self.root_window, atoms, conn)?;
-        ewmh::set_current_desktop(self.current_workspace as u32, self.root_window, atoms, conn)?;
-        ewmh::set_desktop_names(&self.workspaces, self.root_window, atoms, conn)?;
-        ewmh::set_wm_desktop(&self.workspaces, atoms, conn)?;
-        // TODO: when implementing reparenting, update this
-        ewmh::set_client_list(self.window_lookup.keys(), self.root_window, atoms, conn)?;
-        // this is the same as the above
-        ewmh::set_client_list_stacking(self.window_lookup.keys(), self.root_window, atoms, conn)?;
-        ewmh::set_showing_desktop(false, self.root_window, atoms, conn)?;
+        ewmh::set_number_of_desktops(
+            self.workspaces.len() as u32,
+            self.context.root_window,
+            atoms,
+            conn,
+        )?;
+        ewmh::set_current_desktop(
+            self.context.current_workspace as u32,
+            self.context.root_window,
+            atoms,
+            conn,
+        )?;
+        ewmh::set_desktop_names(&self.workspaces, self.context.root_window, atoms, conn)?;
+        ewmh::set_wm_desktop(&self.workspaces, &self.context)?;
+
+        let current_workspace = &self.workspaces[self.context.current_workspace as usize];
+        ewmh::set_client_list(
+            &self
+                .context
+                .window_lookup
+                .values()
+                .map(|v| self.context.windows[*v].window)
+                .collect::<Vec<_>>(),
+            self.context.root_window,
+            atoms,
+            conn,
+        )?;
+        let mut windows =
+            Vec::with_capacity(self.global_windows.max_len() + current_workspace.window_amount());
+        windows.extend(self.global_windows.iter().map(|v| v.window));
+        windows.extend(
+            current_workspace
+                .windows()
+                .map(|v| self.context.windows[v].window),
+        );
+        ewmh::set_client_list_stacking(&windows, self.context.root_window, atoms, conn)?;
+        ewmh::set_showing_desktop(false, self.context.root_window, atoms, conn)?;
 
         Ok(())
     }
 
     pub fn enter_client(&mut self, client: XWindow) {
         for workspace in self.workspaces.iter_mut() {
-            workspace.unfocus_all(&self.connection);
+            workspace.unfocus_all(&mut self.context);
         }
+        self.context.focused_window = None;
 
-        if client == self.root_window {
-            trace_result!(self.connection.send_and_check_request(&SetInputFocus {
+        if client == self.context.root_window {
+            trace_result!(self.context.connection.send_and_check_request(&SetInputFocus {
                 time: CURRENT_TIME,
-                focus: self.root_window,
+                focus: self.context.root_window,
                 revert_to: xcb::x::InputFocus::Parent
             }); "failed to give root focus");
-            self.focused_window = None;
 
             return;
         }
 
-        if let Some(workspace) = self.window_lookup.get(&client) {
-            let workspace = &mut self.workspaces[*workspace as usize];
-            let client = workspace.find_client(|v| v.frame == client);
-            if let Some(client) = client {
-                self.focused_window = Some((client.window, client.frame));
-                workspace.focus_client(*client, &self.connection);
+        if let Some(idx) = self.context.window_lookup.get(&client).copied() {
+            if self.workspaces[self.context.current_workspace as usize]
+                .focus_client(idx, &mut self.context)
+            {
+                self.context.focused_window = Some(idx);
+                return;
             }
-        } else {
-            for reserved_client in self.global_windows.iter() {
-                if reserved_client.window == client {
-                    _ = self.connection.send_and_check_request(&SetInputFocus {
+        }
+        for reserved_client in self.global_windows.iter() {
+            if reserved_client.window == client {
+                _ = self
+                    .context
+                    .connection
+                    .send_and_check_request(&SetInputFocus {
                         time: CURRENT_TIME,
                         focus: reserved_client.window,
                         revert_to: xcb::x::InputFocus::Parent,
                     });
-                    self.focused_window = Some((reserved_client.window, XWindow::none()));
-                    break;
-                }
+                break;
             }
         }
     }
@@ -223,31 +270,50 @@ impl Screen {
     }
 
     pub fn remove_window(&mut self, window: XWindow) {
-        for workspace in self.workspaces.iter_mut() {
-            for client in workspace
-                .remove_window(|client| client.window == window, &self.connection)
-                .iter()
-            {
-                self.window_lookup.remove(&client.frame);
+        if let Some(window_idx) = self.context.window_lookup.get(&window).copied() {
+            for ws in self.workspaces.iter_mut() {
+                ws.remove_window(window_idx, &mut self.context);
             }
-        }
+            self.context.windows[window_idx].destroy(&self.context.connection);
 
-        let len = self.global_windows.len();
-        for i in 0..self.global_windows.len() {
-            let i = len - 1 - i;
-            if self.global_windows[i].window == window {
-                let child = self.global_windows.remove(i);
+            self.context.windows.remove(window_idx);
+            let mut to_remove = vec![];
+            for (k, v) in self.context.window_lookup.iter() {
+                if *v == window_idx {
+                    to_remove.push(*k);
+                }
+            }
+            for k in to_remove {
+                self.context.window_lookup.remove(&k);
+            }
+        };
+
+        for i in 0..self.global_windows.max_len() {
+            let Some(global_window) = self.global_windows.get(i) else {
+                continue;
+            };
+            if global_window.window == window {
+                let child = self
+                    .global_windows
+                    .remove(i)
+                    .expect("we should have a child");
                 self.free_reserved_space(child.reserved, child.direction);
-                _ = self.connection.send_and_check_request(&UnmapWindow {
-                    window: child.window,
-                });
-                _ = self.connection.send_and_check_request(&DestroyWindow {
-                    window: child.window,
-                });
+                _ = self
+                    .context
+                    .connection
+                    .send_and_check_request(&UnmapWindow {
+                        window: child.window,
+                    });
+                _ = self
+                    .context
+                    .connection
+                    .send_and_check_request(&DestroyWindow {
+                        window: child.window,
+                    });
             }
         }
 
-        trace_result!(self.connection.flush(); "failed to flush the connection after window remove");
+        trace_result!(self.context.connection.flush(); "failed to flush the connection after window remove");
     }
 
     fn handle_reserved_client(&mut self, window: XWindow, values: [u32; 12]) -> anyhow::Result<()> {
@@ -337,24 +403,25 @@ impl Screen {
     pub fn add_window(&mut self, window: XWindow) -> anyhow::Result<()> {
         // checking for strut and partial strut
         {
-            let strut_partial_cookie = self.connection.send_request(&xcb::x::GetProperty {
+            let strut_partial_cookie = self.context.connection.send_request(&xcb::x::GetProperty {
                 delete: false,
                 window,
-                property: self.atoms.net_wm_strut_partial,
+                property: self.context.atoms.net_wm_strut_partial,
                 r#type: ATOM_CARDINAL,
                 long_offset: 0,
                 long_length: 12,
             });
-            let strut_cookie = self.connection.send_request(&xcb::x::GetProperty {
+            let strut_cookie = self.context.connection.send_request(&xcb::x::GetProperty {
                 delete: false,
                 window,
-                property: self.atoms.net_wm_strut,
+                property: self.context.atoms.net_wm_strut,
                 r#type: ATOM_CARDINAL,
                 long_offset: 0,
                 long_length: 4,
             });
 
             if let Some(values) = self
+                .context
                 .connection
                 .wait_for_reply(strut_partial_cookie)?
                 .value::<u32>()
@@ -366,10 +433,11 @@ impl Screen {
                         .try_into()
                         .context("strut_partial_cookie returned in invalid value")?,
                 )?;
-                self.update_atoms();
+                let _ = self.update_atoms();
                 return Ok(());
             }
             if let Some(values) = self
+                .context
                 .connection
                 .wait_for_reply(strut_cookie)?
                 .value::<u32>()
@@ -381,85 +449,99 @@ impl Screen {
                         values[0], values[1], values[2], values[3], 0, 0, 0, 0, 0, 0, 0, 0,
                     ],
                 )?;
-                self.update_atoms();
+                let _ = self.update_atoms();
                 return Ok(());
             }
         }
 
         // if we have neither of those elements
-        let client = Client::new(window, self.root_window, &self.connection)?;
-        self.window_lookup
-            .insert(client.frame, self.current_workspace);
-        println!("client: {client:?}");
-        self.workspaces[self.current_workspace as usize].spawn_window(client, &self.connection);
+        let client = Client::new(
+            window,
+            self.context.root_window,
+            &self.context.connection,
+            &self.context.atoms,
+            self.context.current_workspace,
+        )?;
+
+        let frame = client.frame;
+        let window = client.window;
+        let idx = self.context.windows.push(client);
+        self.context.window_lookup.insert(frame, idx);
+        self.context.window_lookup.insert(window, idx);
+        self.workspaces[self.context.current_workspace as usize]
+            .spawn_window(idx, &mut self.context);
         Ok(())
     }
 
     pub fn close_focused_window(&mut self) {
-        let Some((window, frame)) = self.focused_window else {
+        let Some(idx) = self.context.focused_window.take() else {
             return;
         };
-        self.focused_window = None;
 
-        if frame.is_none() {
-            // global window
+        if self.context.windows[idx].close(&self.context.atoms, &self.context.connection) {
+            self.workspaces
+                .iter_mut()
+                .for_each(|v| v.remove_window(idx, &mut self.context));
 
-            let len = self.global_windows.len();
-            for i in 0..len {
-                let i = len - 1 - i;
-                if self.global_windows[i].window == window {
-                    if ewmh::delete_window(
-                        self.global_windows[i].window,
-                        &self.atoms,
-                        &self.connection,
-                    ) {
-                        let client = self.global_windows.remove(i);
-                        self.free_reserved_space(client.reserved, client.direction);
-                    }
+            self.context.windows.remove(idx);
+            let mut to_remove = vec![];
+            for (k, v) in self.context.window_lookup.iter() {
+                if *v == idx {
+                    to_remove.push(*k);
                 }
             }
-        } else {
-            if let Some(&workspace_id) = self.window_lookup.get(&frame) {
-                for client in self.workspaces[workspace_id as usize].close_window(
-                    |c| c.window == window,
-                    &self.atoms,
-                    &self.connection,
-                ) {
-                    self.window_lookup.remove(&client.frame);
-                }
+            for k in to_remove {
+                self.context.window_lookup.remove(&k);
             }
         }
     }
 
     pub fn cycle_layout(&mut self) {
-        self.workspaces[self.current_workspace as usize].cycle_layout(&self.connection);
+        self.workspaces[self.context.current_workspace as usize].cycle_layout(&mut self.context);
         _ = self.update_atoms();
     }
 
     pub fn set_layout(&mut self, new_layout: Layout) {
-        self.workspaces[self.current_workspace as usize].set_layout(new_layout, &self.connection);
+        self.workspaces[self.context.current_workspace as usize]
+            .set_layout(new_layout, &mut self.context);
         _ = self.update_atoms();
     }
 
     pub fn kill_children(&mut self) {
-        let mut cookies = vec![self.connection.send_request_checked(&SetInputFocus {
-            focus: self.root_window,
-            revert_to: xcb::x::InputFocus::Parent,
-            time: CURRENT_TIME,
-        })];
+        let mut cookies = vec![self
+            .context
+            .connection
+            .send_request_checked(&SetInputFocus {
+                focus: self.context.root_window,
+                revert_to: xcb::x::InputFocus::Parent,
+                time: CURRENT_TIME,
+            })];
 
-        for client in self.workspaces.iter().flat_map(Workspace::windows) {
-            cookies.push(self.connection.send_request_checked(&DestroyWindow {
-                window: client.window,
-            }));
-            cookies.push(self.connection.send_request_checked(&DestroyWindow {
-                window: client.frame,
-            }));
+        for client in self.context.windows.iter() {
+            cookies.push(
+                self.context
+                    .connection
+                    .send_request_checked(&DestroyWindow {
+                        window: client.window,
+                    }),
+            );
+            cookies.push(
+                self.context
+                    .connection
+                    .send_request_checked(&DestroyWindow {
+                        window: client.frame,
+                    }),
+            );
         }
+
         for window in self.global_windows.iter() {
-            cookies.push(self.connection.send_request_checked(&DestroyWindow {
-                window: window.window,
-            }));
+            cookies.push(
+                self.context
+                    .connection
+                    .send_request_checked(&DestroyWindow {
+                        window: window.window,
+                    }),
+            );
         }
 
         self.global_windows.clear();
@@ -467,12 +549,15 @@ impl Screen {
         self.reserved_space_left = 0;
         self.reserved_space_right = 0;
         self.reserved_space_top = 0;
+        self.context.windows.clear();
+        self.context.focused_window = None;
+        self.context.window_lookup.clear();
         self.workspaces
             .iter_mut()
             .for_each(Workspace::clear_windows);
 
         for cookie in cookies.into_iter() {
-            _ = self.connection.check_request(cookie);
+            _ = self.context.connection.check_request(cookie);
         }
     }
 
@@ -538,15 +623,44 @@ pub struct ReservedClient {
     direction: ScreenSide,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Client {
     pub window: XWindow,
-    frame: XWindow,
-    visible: bool,
+    pub frame: XWindow,
+    pub visible: bool,
+    pub name: String,
+
+    pub width: u16,
+    pub height: u16,
+    pub x: u16,
+    pub y: u16,
+    pub workspace: u8,
 }
 
 impl Client {
-    pub fn new(window: XWindow, root_window: XWindow, conn: &Connection) -> Result<Self> {
+    pub fn new(
+        window: XWindow,
+        root_window: XWindow,
+        conn: &Connection,
+        atoms: &Atoms,
+        workspace: u8,
+    ) -> Result<Self> {
+        let name = conn.wait_for_reply(conn.send_request(&GetProperty {
+            window,
+            long_length: 128,
+            long_offset: 0,
+            property: atoms.net_wm_name,
+            delete: false,
+            r#type: ATOM_ANY,
+        }));
+        let name = name
+            .ok()
+            .as_ref()
+            .map(GetPropertyReply::value::<u8>)
+            .and_then(|v| str::from_utf8(v).ok())
+            .map(str::to_string)
+            .unwrap_or_default();
+
         let frame = conn.generate_id();
         conn.send_and_check_request(&CreateWindow {
             depth: COPY_FROM_PARENT as u8,
@@ -559,7 +673,15 @@ impl Client {
             height: 1,
             parent: root_window,
             visual: COPY_FROM_PARENT,
-            value_list: &[Cw::BackPixel(0), Cw::BorderPixel(config::BORDER_COLOR)],
+            value_list: &[
+                Cw::BackPixel(0),
+                Cw::BorderPixel(config::BORDER_COLOR),
+                Cw::EventMask(
+                    EventMask::PROPERTY_CHANGE
+                        | EventMask::SUBSTRUCTURE_NOTIFY
+                        | EventMask::ENTER_WINDOW,
+                ),
+            ],
         })
         .context("failed to create a frame")?;
 
@@ -573,24 +695,27 @@ impl Client {
 
         trace_result!(conn.send_and_check_request(&ChangeWindowAttributes {
             window: frame,
-            value_list: &[Cw::EventMask(EventMask::SUBSTRUCTURE_NOTIFY | EventMask::PROPERTY_CHANGE | EventMask::ENTER_WINDOW | EventMask::KEY_PRESS | EventMask::KEY_RELEASE)]
+            value_list: &[Cw::EventMask(EventMask::SUBSTRUCTURE_NOTIFY | EventMask::ENTER_WINDOW | EventMask::KEY_PRESS | EventMask::KEY_RELEASE)]
         }); "failed to enable client events for the frame");
 
         Ok(Self {
             window,
             visible: false,
             frame,
+            name,
+            width: 1,
+            height: 1,
+            x: 0,
+            y: 0,
+            workspace,
         })
     }
-}
 
-impl AbstractWindow for Client {
-    fn destroy(&mut self, conn: &Connection) {
-        trace_result!(conn.send_and_check_request(&UnmapWindow { window: self.frame }); "failed to unmap the frame");
+    pub fn destroy(&mut self, conn: &Connection) {
         trace_result!(conn.send_and_check_request(&DestroyWindow { window: self.frame }); "failed to destroy the frame");
     }
 
-    fn close(&mut self, atoms: &Atoms, conn: &Connection) -> bool {
+    pub fn close(&mut self, atoms: &Atoms, conn: &Connection) -> bool {
         if ewmh::delete_window(self.window, atoms, conn) {
             self.destroy(conn);
             true
@@ -599,7 +724,7 @@ impl AbstractWindow for Client {
         }
     }
 
-    fn focus(&mut self, conn: &Connection) {
+    pub fn focus(&mut self, conn: &Connection) {
         trace_result!(conn.send_and_check_request(&ChangeWindowAttributes {
             window: self.frame,
             value_list: &[Cw::BorderPixel(config::BORDER_COLOR_ACTIVE)],
@@ -611,14 +736,14 @@ impl AbstractWindow for Client {
         }); "failed to focus the input");
     }
 
-    fn unfocus(&mut self, conn: &Connection) {
+    pub fn unfocus(&mut self, conn: &Connection) {
         trace_result!(conn.send_and_check_request(&ChangeWindowAttributes {
             window: self.frame,
             value_list: &[Cw::BorderPixel(config::BORDER_COLOR)],
         }); "failed to reset the border color");
     }
 
-    fn update(&mut self, width: u16, height: u16, x: u16, y: u16, conn: &Connection) {
+    pub fn update(&mut self, width: u16, height: u16, x: u16, y: u16, conn: &Connection) {
         let border_double = config::BORDER_SIZE * 2;
 
         trace_result!(conn.send_and_check_request(&ConfigureWindow {
@@ -634,26 +759,33 @@ impl AbstractWindow for Client {
             window: self.window,
             value_list: &[
                 ConfigWindow::X(0),
-                ConfigWindow::Y(0),
+                ConfigWindow::Y(WINDOW_BAR_HEIGHT as i32),
                 ConfigWindow::Width((width - border_double) as u32),
-                ConfigWindow::Height((height - border_double) as u32),
+                ConfigWindow::Height((height - border_double - WINDOW_BAR_HEIGHT) as u32),
             ],
         }));
     }
 
-    fn hide(&mut self, conn: &Connection) {
+    pub fn hide(&mut self, conn: &Connection) {
         self.visible = false;
-        _ = conn.send_and_check_request(&UnmapWindow {
+        let window_unmap = conn.send_request_checked(&UnmapWindow {
             window: self.window,
         });
-        _ = conn.send_and_check_request(&UnmapWindow { window: self.frame });
+        let frame_unmap = conn.send_request_checked(&UnmapWindow { window: self.frame });
+        trace_result!(
+            conn.check_request(window_unmap);
+            "failed to unmap the window"
+        );
+        trace_result!(conn.check_request(frame_unmap); "failed to unmap the frame");
     }
 
-    fn show(&mut self, conn: &Connection) {
+    pub fn show(&mut self, conn: &Connection) {
         self.visible = true;
-        trace_result!(conn.send_and_check_request(&MapWindow { window: self.frame }));
-        trace_result!(conn.send_and_check_request(&MapWindow {
-            window: self.window
-        }));
+        let map_frame = conn.send_request_checked(&MapWindow { window: self.frame });
+        let map_window = conn.send_request_checked(&MapWindow {
+            window: self.window,
+        });
+        trace_result!(conn.check_request(map_frame); "failed to map the frame");
+        trace_result!(conn.check_request(map_window); "failed to map the window");
     }
 }
